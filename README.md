@@ -53,6 +53,12 @@ icons/              — extension icons (16/32/48/128 px)
 - Some fingerprinting scripts may cross-check other signals (e.g. `Intl.NumberFormat`, keyboard layout, `navigator.language`) that this extension does not currently spoof.
 - Declarative `"world": "MAIN"` content scripts require a reasonably recent Firefox/Chromium version.
 
+## Comparison (Before / After)
+
+| Before (Original) | After (Spoofed) |
+| :---: | :---: |
+| ![Before](img/befory.png) | ![After](img/after.png) |
+
 ## License
 
 MIT
