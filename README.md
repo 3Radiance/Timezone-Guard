@@ -1,5 +1,7 @@
 # Timezone Guard
 
+[![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox)](https://addons.mozilla.org/addon/timezone-guard/)
+
 *[Читать на русском](ru/README.ru.md)*
 
 A Firefox extension that spoofs the time zone and (optionally) the User-Agent reported by the browser to websites — across all contexts: the main page, iframes (any nesting depth), Dedicated Worker, Shared Worker, and Service Worker.
@@ -82,7 +84,8 @@ icons/
 
 | Before (Original) | After (Spoofed) |
 | :---: | :---: |
-| ![Before](img/befory.png) | ![After](img/after.png) |
+| ![Before](img/before.png) | ![After](img/after.png) |
+| ![Before](img/creep-js-workers-before.png) | ![After](img/creep-js-workers-after.png) |
 
 ## License
 

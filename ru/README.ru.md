@@ -1,5 +1,7 @@
 # Timezone Guard
 
+[![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox)](https://addons.mozilla.org/addon/timezone-guard/)
+
 *[Read in English](../README.md)*
 
 Расширение для Firefox, которое подменяет часовой пояс и (опционально) User-Agent, которые браузер сообщает сайтам — во всех контекстах: главной странице, iframe (любой глубины вложенности), Dedicated Worker, Shared Worker и Service Worker.
@@ -82,7 +84,8 @@ icons/
 
 | До (оригинал) | После (подмена) |
 | :---: | :---: |
-| ![До](../img/befory.png) | ![После](../img/after.png) |
+| ![До](../img/before.png) | ![После](../img/after.png) |
+| ![До](../img/creep-js-workers-before.png) | ![После](../img/creep-js-workers-after.png) |
 
 ## Лицензия
 
