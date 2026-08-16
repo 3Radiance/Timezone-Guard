@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 320px;
+      padding: 16px;
+      font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+    }
+    h3 {
+      margin: 0 0 12px 0;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .section {
+      margin-bottom: 16px;
+    }
+    .section label {
+      display: block;
+      font-size: 11px;
+      color: #a6adc8;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    select, input[type="text"] {
+      width: 100%;
+      padding: 8px;
+      border-radius: 6px;
+      border: 1px solid #45475a;
+      background: #313244;
+      color: #cdd6f4;
+      font-size: 13px;
+      margin-bottom: 8px;
+      box-sizing: border-box;
+    }
+    input[type="text"] {
+      font-family: monospace;
+      margin-bottom: 0;
+    }
+    button {
+      width: 100%;
+      padding: 8px;
+      border-radius: 6px;
+      border: none;
+      background: #89b4fa;
+      color: #1e1e2e;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { background: #74a8f9; }
+    #status {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #a6e3a1;
+      text-align: center;
+      min-height: 14px;
+    }
+  </style>
+</head>
+<body>
+  <h3>TimeZone-Guard</h3>
+  
+  <div class="section">
+    <label for="tzSelect">Timezone</label>
+    <select id="tzSelect">
+      <option value="Europe/Helsinki">Europe/Helsinki</option>
+      <option value="Europe/Moscow">Europe/Moscow</option>
+      <option value="Europe/London">Europe/London</option>
+      <option value="Europe/Berlin">Europe/Berlin</option>
+      <option value="Europe/Kyiv">Europe/Kyiv</option>
+      <option value="America/New_York">America/New_York</option>
+      <option value="America/Los_Angeles">America/Los_Angeles</option>
+      <option value="Asia/Dubai">Asia/Dubai</option>
+      <option value="Asia/Tokyo">Asia/Tokyo</option>
+    </select>
+  </div>
+
+  <div class="section">
+    <label for="uaPresetSelect">User-Agent Presets</label>
+    <select id="uaPresetSelect">
+      <option value="">Default (No Spoof)</option>
+      
+      <optgroup label="Chrome 124">
+        <option value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36">Windows</option>
+        <option value="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36">macOS</option>
+        <option value="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36">Linux</option>
+      </optgroup>
+
+      <optgroup label="Firefox 125">
+        <option value="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0">Windows</option>
+        <option value="Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0">macOS</option>
+        <option value="Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0">Linux</option>
+      </optgroup>
+    </select>
+    
+    <label for="uaInput" style="margin-top: 10px;">Custom User-Agent</label>
+    <input type="text" id="uaInput" placeholder="Выберите пресет выше и измените...">
+  </div>
+
+  <button id="saveBtn">Save & Apply</button>
+  <div id="status"></div>
+  <script src="./popup.js"></script>
+</body>
+</html>
