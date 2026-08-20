@@ -1,34 +1,33 @@
-
 import { buildWorkerPatchSource } from "./build_worker.js"
 
-let currentTZ = 'Atlantic/Reykjavik';
-let currentUA = '';
 let knownSWUrls = new Set();
 let pendingSWRequests = new Set();
 
+const langMap = {
+  'Europe/Helsinki': 'fi-FI', 'Europe/Moscow': 'ru-RU', 'Europe/London': 'en-GB',
+  'Europe/Berlin': 'de-DE', 'Europe/Kyiv': 'uk-UA', 'America/New_York': 'en-US',
+  'America/Los_Angeles': 'en-US', 'Asia/Dubai': 'ar-AE', 'Asia/Tokyo': 'ja-JP'
+};
+
+function buildAcceptLanguage(tz) {
+  const lang = langMap[tz] || 'en-US';
+  const base = lang.split('-')[0];
+  if (lang === 'en-US') return 'en-US,en;q=0.9';
+  return `${lang},${base};q=0.9,en-US;q=0.8,en;q=0.7`;
+}
+
 console.log('[TZ-GUARD bg] background.js loaded');
 
-browser.storage.local.get(['tz', 'ua', 'swUrls']).then((result) => {
-  if (result.tz) currentTZ = result.tz;
-  if (result.ua) currentUA = result.ua;
+// Load SW URLs once at startup
+browser.storage.local.get(['swUrls']).then((result) => {
   if (Array.isArray(result.swUrls)) {
     knownSWUrls = new Set(result.swUrls);
     console.log('[TZ-GUARD bg] Loaded known SW URLs from storage:', Array.from(knownSWUrls));
   }
-  console.log('[TZ-GUARD bg] Init complete. TZ:', currentTZ, 'UA:', currentUA ? 'Set' : 'Empty');
 }).catch((e) => console.log('[TZ-GUARD bg] Storage load error:', e));
 
-browser.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local') {
-    if (changes.tz) currentTZ = changes.tz.newValue || 'Atlantic/Reykjavik';
-    if (changes.ua) currentUA = changes.ua.newValue || '';
-    console.log('[TZ-GUARD bg] Config updated. TZ:', currentTZ, 'UA:', currentUA ? 'Set' : 'Empty');
-  }
-});
-
-
-
-browser.runtime.onMessage.addListener((message) => {
+// Message handler: SW registration + config requests
+browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message && message.type === 'tz-guard-sw-register' && message.url) {
     if (!knownSWUrls.has(message.url)) {
       knownSWUrls.add(message.url);
@@ -37,10 +36,95 @@ browser.runtime.onMessage.addListener((message) => {
     } else {
       console.log('[TZ-GUARD bg] [Msg] SW URL already known:', message.url);
     }
+    return;
+  }
+
+  if (message && message.type === 'get-config') {
+    browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders']).then((result) => {
+      sendResponse({
+        tz: result.tz || '',
+        ua: result.ua || '',
+        enabled: result.enabled !== false,
+        spoofHeaders: result.spoofHeaders !== false
+      });
+    }).catch(() => {
+      sendResponse({ tz: '', ua: '', enabled: true, spoofHeaders: true });
+    });
+    return true; 
   }
 });
 
 
+// Broadcast config to all tabs when settings change
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+
+  browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders']).then((result) => {
+    var cfg = {
+      type: 'config-update',
+      tz: result.tz || '',
+      ua: result.ua || '',
+      enabled: result.enabled !== false,
+      spoofHeaders: result.spoofHeaders !== false
+    };
+    browser.tabs.query({}).then((tabs) => {
+      for (var i = 0; i < tabs.length; i++) {
+        try {
+          browser.tabs.sendMessage(tabs[i].id, cfg).catch(() => {});
+        } catch (e) {}
+      }
+    }).catch(() => {});
+  }).catch(() => {});
+});
+
+
+// Combined listener: Accept-Language + User-Agent header spoofing.
+// Reads storage INSIDE the handler — never relies on cached globals.
+browser.webRequest.onBeforeSendHeaders.addListener(
+  async (details) => {
+    try {
+      const result = await browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders']);
+      const enabled = result.enabled !== false;
+      const spoofHeaders = result.spoofHeaders !== false;
+
+      if (!enabled || !spoofHeaders) return;
+
+      const currentTZ = result.tz || 'Atlantic/Reykjavik';
+      const currentUA = result.ua || '';
+      const headers = details.requestHeaders || [];
+      const acceptLanguageValue = buildAcceptLanguage(currentTZ);
+      let foundAL = false;
+      let foundUA = false;
+
+      for (const h of headers) {
+        const nameLower = h.name.toLowerCase();
+        if (nameLower === 'accept-language') {
+          h.value = acceptLanguageValue;
+          foundAL = true;
+        }
+        if (nameLower === 'user-agent' && currentUA) {
+          h.value = currentUA;
+          foundUA = true;
+        }
+      }
+      if (!foundAL) {
+        headers.push({ name: 'Accept-Language', value: acceptLanguageValue });
+      }
+      if (!foundUA && currentUA) {
+        headers.push({ name: 'User-Agent', value: currentUA });
+      }
+
+      return { requestHeaders: headers };
+    } catch (e) {
+      console.error('[TZ-GUARD bg] onBeforeSendHeaders error:', e);
+    }
+  },
+  { urls: ['<all_urls>'] },
+  ['blocking', 'requestHeaders']
+);
+
+
+// Detect Service Worker script requests
 browser.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     const isServiceWorkerScript = (details.requestHeaders || []).some(
@@ -56,20 +140,28 @@ browser.webRequest.onBeforeSendHeaders.addListener(
 );
 
 
+// Inject patch into Service Worker scripts — reads storage inside handler.
 browser.webRequest.onBeforeRequest.addListener(
-  (details) => {
-    const matchedByUrl = knownSWUrls.has(details.url);
-    const matchedByHeader = pendingSWRequests.has(details.requestId);
-    
-    if (!matchedByUrl && !matchedByHeader) return;
-
-    console.log('[TZ-GUARD bg] [BeforeRequest] Matched SW script for patching! URL:', details.url, 'ID:', details.requestId);
-
+  async (details) => {
     try {
+      const result = await browser.storage.local.get(['tz', 'ua', 'enabled']);
+      const enabled = result.enabled !== false;
+
+      if (!enabled) return;
+
+      const matchedByUrl = knownSWUrls.has(details.url);
+      const matchedByHeader = pendingSWRequests.has(details.requestId);
+
+      if (!matchedByUrl && !matchedByHeader) return;
+
+      console.log('[TZ-GUARD bg] [BeforeRequest] Matched SW script for patching! URL:', details.url, 'ID:', details.requestId);
+
       const filter = browser.webRequest.filterResponseData(details.requestId);
       console.log('[TZ-GUARD bg] [Filter] Created successfully for:', details.url);
       const encoder = new TextEncoder();
       let injected = false;
+      const currentTZ = result.tz || 'Atlantic/Reykjavik';
+      const currentUA = result.ua || '';
 
       filter.ondata = (event) => {
         if (!injected) {

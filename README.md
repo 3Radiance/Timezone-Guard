@@ -12,55 +12,74 @@ Websites infer approximate location and browser characteristics via `Intl.DateTi
 
 ## Features
 
-- Time zone spoofing (`Intl.DateTimeFormat`, `Date.prototype.getTimezoneOffset`, `toString` / `toDateString` / `toTimeString` / `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString`)
-- Optional User-Agent spoofing (`navigator.userAgent`, `appVersion`, `platform`, `vendor`, `language(s)`, `userAgentData` for Chrome-like UAs)
-- Works consistently in: main window, iframe (including nested iframe-within-iframe), Dedicated Worker, Shared Worker, Service Worker
-- Real system clock and `Date.now()` are left untouched — only how the date is *interpreted and displayed* in the chosen time zone is changed
-- Cached `Intl.DateTimeFormat` formatters — the spoof does not introduce noticeable delay compared to native behavior (important against timing detectors like CreepJS)
-- Works on sites with strict Content-Security-Policy (Spotify Web Player and similar) — the patch is injected declaratively via `world: "MAIN"`, not through a `<script>` tag in the DOM
-- No new properties on `window` — all shared state lives inside the closure of a single file and is not enumerable from the outside
+- **Time zone spoofing** — `Intl.DateTimeFormat`, `Date.prototype.getTimezoneOffset`, `toString` / `toDateString` / `toTimeString` / `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString`
+- **Optional User-Agent spoofing** — `navigator.userAgent`, `appVersion`, `platform`, `vendor`, `language`, `languages`, `maxTouchPoints`, `oscpu` (Firefox), and related properties
+- **HTTP header spoofing** — optionally modifies outgoing `Accept-Language` and `User-Agent` headers to match the selected timezone and browser identifier
+- **Consistent across all contexts** — main window, iframe (including nested iframe-within-iframe), Dedicated Worker, Shared Worker, Service Worker
+- **Real system clock untouched** — `Date.now()` and the actual OS clock are not modified; only how the date is *interpreted and displayed* in the chosen time zone is changed
+- **Cached formatters** — `Intl.DateTimeFormat` and `Intl.NumberFormat` formatters are cached to avoid timing detection (important against detectors like CreepJS)
+- **CSP-safe** — works on sites with strict Content-Security-Policy (Spotify Web Player and similar) via declarative injection through `world: "MAIN"`
+- **No enumerable globals** — all shared state lives inside the closure of a single file and is not enumerable from the outside
+- **Temporal API support** — patches `Temporal.Now.timeZoneId` and related methods when available
+- **Number format spoofing** — `Intl.NumberFormat` and `Number.prototype.toLocaleString` use the spoofed locale
 
 ## How it works
 
 ### Main page and iframes — `spoof/main.js`
 
-A single content script injected by the browser directly into the page's main world (`world: "MAIN"` in the manifest, rather than via `document.createElement('script')` — this is the only way to bypass the page's CSP, since such injection is not treated as code added by the page itself).
+A single content script injected by the browser directly into the page's main world (`world: "MAIN"` in the manifest). This bypasses the page's CSP, since such injection is not treated as code added by the page itself.
 
-- `Intl.DateTimeFormat` and `Date.prototype` methods are patched once per window, with cached formatters (no re-creating `Intl.DateTimeFormat` on every call — otherwise detectors flag the spoof by execution timing).
+- `Intl.DateTimeFormat`, `Intl.NumberFormat`, and `Date.prototype` methods are patched once per window, with cached formatters.
 - `navigator.userAgent` and related properties are patched via `Object.defineProperty` on `Navigator.prototype`.
 - All patched functions are masked as `[native code]` via a custom `toString` wrapper.
-- **iframe**: instead of `MutationObserver` (which is always asynchronous and can't fire before synchronous code reads `iframe.contentWindow` in the same tick), the getter `contentWindow` / `contentDocument` on `HTMLIFrameElement.prototype` is patched — the spoof is applied at the moment of access, not at the moment the element is inserted into the DOM. The patch is recursively applied to `HTMLIFrameElement.prototype` inside every patched window, so iframe-within-iframe also works.
-- **Dedicated / Shared Worker**: the `Worker` / `SharedWorker` constructors are wrapped so that our patch runs before the worker's original script, and the original file itself is loaded from inside the worker via `importScripts()` — without a blocking synchronous XHR on the main thread (which would otherwise produce a noticeable timing signal).
-- **Service Worker**: `navigator.serviceWorker.register()` is intercepted to learn the exact URL of the worker script — this information is sent to the background via `bridge.js`.
+- **iframe**: instead of `MutationObserver` (which is always asynchronous), the getter `contentWindow` / `contentDocument` on `HTMLIFrameElement.prototype` is patched — the spoof is applied at the moment of access, not at DOM insertion. Recursive patching handles iframe-within-iframe.
+- **Dedicated / Shared Worker**: the `Worker` / `SharedWorker` constructors are wrapped so that our patch runs before the worker's original script, loaded via `importScripts()` — without blocking synchronous XHR on the main thread.
+- **Service Worker**: `navigator.serviceWorker.register()` is intercepted to learn the exact URL of the worker script, sent to the background via `bridge.js`.
 
 ### `bridge.js` (isolated world)
 
-Reads the saved `tz` / `ua` from `browser.storage.local` and passes them to `main.js` through a temporary DOM attribute on `<html>` (immediately removed after reading) — this is the only CSP-safe way to transfer data between the isolated and main worlds without injecting a `<script>` tag.
+Reads saved `tz` / `ua` / `enabled` / `spoofHeaders` from `browser.storage.local` and passes them to `main.js` through three mechanisms:
+1. **DOM attributes** on `<html>` — available immediately at `document_start`.
+2. **`sessionStorage` / `localStorage`** fallback (`__tzGuardConfig`) — survives page reloads and bfcache restores.
+3. **`CustomEvent`** (`tz-guard-update-config`) — for live updates when settings change in the popup.
 
 ### `background/background.js` + `background/build_worker.js`
 
-A Service Worker cannot be patched the same way as a Dedicated / Shared Worker — the specification requires the registration URL to be a plain `http(s)`; `blob:` is forbidden at the browser level. Therefore a network-response interception is used here:
+Service Workers cannot be patched via `blob:` URLs (forbidden by spec). Therefore network-response interception is used:
 
-- `webRequest.onBeforeRequest` + `webRequest.filterResponseData` (requires the `webRequestFilterResponse.serviceWorkerScript` permission) splices the patch code into the beginning of the response body for the Service Worker script, before the browser parses it.
-- The filter must be installed in `onBeforeRequest`, not later (`onHeadersReceived`) — otherwise you may be too late and hit Firefox's internal optimized script byte-cache (`Invalid request ID`).
-- The URL of the registering SW script is determined from the message sent by `main.js` / `bridge.js` (intercepting `register()`), not from the `Service-Worker: script` header — the header is not always visible to extensions in all browser builds.
+- `webRequest.onBeforeRequest` + `webRequest.filterResponseData` (requires `webRequestFilterResponse.serviceWorkerScript`) splices the patch code into the beginning of the Service Worker script response.
+- The filter must be installed in `onBeforeRequest`, not later, to avoid Firefox's internal script byte-cache (`Invalid request ID`).
+- Known Service Worker URLs are persisted in `storage.local` (`swUrls`) so patches survive browser restarts.
+
+### HTTP Header Spoofing
+
+When **"Spoof HTTP Headers"** is enabled in the popup, the extension modifies outgoing request headers via `webRequest.onBeforeSendHeaders`:
+- **`Accept-Language`** — derived from the selected timezone (e.g., `Europe/Helsinki` → `fi-FI,fi;q=0.9,en-US;q=0.8,en;q=0.7`).
+- **`User-Agent`** — set to the custom UA if provided.
+
+## Popup settings
+
+- **Extension Enabled** — master toggle; disables all spoofing when turned off.
+- **Spoof HTTP Headers** — toggles modification of outgoing `Accept-Language` and `User-Agent` headers.
+- **Timezone** — select the timezone to report.
+- **User-Agent** — choose from presets or enter a custom string.
 
 ## Installation (development / temporary extension)
 
 1. `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** → select `manifest.json`.
-2. Open the popup, choose a time zone (and optionally a User-Agent), **Save & Apply**.
-3. Fully close and reopen the tab (not just F5 — temporary extensions in Firefox get a new `moz-extension://` UUID on every reload, and old tabs may reference a now-invalid address).
+2. Open the popup, choose a time zone (and optionally a User-Agent), adjust toggles, **Save & Apply**.
+3. Fully close and reopen the tab (not just F5 — temporary extensions in Firefox get a new `moz-extension://` UUID on every reload).
 
 ## Project structure
 
 ```
 manifest.json
-bridge.js                     — isolated world: reads storage, passes tz/ua via DOM attribute
+bridge.js                     — isolated world: reads storage, passes config via DOM + storage events
 spoof/
-  main.js                     — all patches (Intl/Date/UA/iframe/Worker/SharedWorker), one file, one IIFE
+  main.js                     — all patches (Intl/Date/UA/iframe/Worker/SharedWorker/Temporal), one file, one IIFE
 background/
-  background.js                — network response interception and patching
-  build_worker.js               — patch-code generator for workers (module, used by background.js)
+  background.js                — network response interception, header spoofing, SW URL tracking
+  build_worker.js               — patch-code generator for Service Worker injection (module)
 frontend/
   popup.html
   popup.js
@@ -69,23 +88,26 @@ icons/
 
 ## Permissions
 
-- `storage` — saves the selected tz/ua locally
-- `<all_urls>` (host permission) — the spoof must apply on any site, before the site's own scripts run
-- `webRequest`, `webRequestBlocking`, `webRequestFilterResponse`, `webRequestFilterResponse.serviceWorkerScript` — required exclusively for patching the Service Worker via network response interception
+- `storage` — saves the selected tz/ua and settings locally; persists known SW URLs.
+- `<all_urls>` (host permission) — the spoof must apply on any site, before the site's own scripts run.
+- `webRequest`, `webRequestBlocking`, `webRequestFilterResponse`, `webRequestFilterResponse.serviceWorkerScript` — required for patching Service Workers via network response interception and for HTTP header modification.
 
 ## Known limitations
 
-- **Indexed access `window[n]` / `window.frames[n]`** — accessing a child browsing context by numeric index is exotic internal behavior of `WindowProxy` at the engine level, not an ordinary JS property. `Object.defineProperty` cannot intercept it (unlike `contentWindow`, which is an ordinary accessor property of the prototype). The first such access returns real data; subsequent accesses through `.contentWindow` are already patched.
-- **"Dead" (detached) iframes** — a reference to a `window` of an iframe removed from the DOM, obtained through a non-standard access path, may remain unpatched.
-- After changing tz/ua in the popup, open tabs must be reloaded — the spoof is applied at page load time, not retroactively in real time (although an already open tab will pick up the new value "live" for future API calls if the popup was opened before the page reload).
-- The extension only changes what is *reported* through JS APIs — the operating system clock and time zone are not touched.
+- **Indexed access `window[n]` / `window.frames[n]`** — numeric index access is exotic internal `WindowProxy` behavior, not an ordinary JS property. `Object.defineProperty` cannot intercept it. The first such access returns real data; subsequent accesses through `.contentWindow` are already patched.
+- **"Dead" (detached) iframes** — a reference to a removed iframe's window, obtained through a non-standard access path, may remain unpatched.
+- **Live updates require reload** — after changing tz/ua in the popup, open tabs must be reloaded. The spoof is applied at page load time, not retroactively (although an already open tab will pick up new values for future API calls if the popup was opened before the page reload).
+- **OS clock untouched** — the extension only changes what is *reported* through JS APIs and HTTP headers. The operating system clock and time zone are not modified.
 
 ## Comparison (Before / After)
 
-| Before (Original) | After (Spoofed) |
-| :---: | :---: |
-| ![Before](img/before.png) | ![After](img/after.png) |
-| ![Before](img/creep-js-workers-before.png) | ![After](img/creep-js-workers-after.png) |
+| | Before | After |
+|---|---|---|
+| **BrowserLeaks — HTTP Headers** | ![Before](img/before/browserleaksHTTP.png) | ![After](img/after/browserleaksHTTP.png) |
+| **BrowserLeaks — JS APIs** | ![Before](img/before/browserleaksJS.png) | ![After](img/after/browserleaksJS.png) |
+| **CreepJS — Fingerprint** | ![Before](img/before/CreepJS.png) | ![After](img/after/CreepJS.png) |
+| **CreepJS — Timezone** | ![Before](img/before/CreepJStz.png) | ![After](img/after/CreepJStz.png) |
+| **CreepJS — Workers** | ![Before](img/before/CreepJSworkers.png) | ![After](img/after/CreepJSworkers.png) |
 
 ## License
 
