@@ -9,7 +9,7 @@ function __tzGuardWorkerPatch(TARGET_TIMEZONE, TARGET_UA) {
       'America/Los_Angeles': 'en-US', 'Asia/Dubai': 'ar-AE', 'Asia/Tokyo': 'ja-JP'
     };
     var SPOOFED_LANG = langMap[TARGET_TIMEZONE] || 'en-US';
-    var SPOOFED_LANGS = Object.freeze([SPOOFED_LANG, 'en-US']);
+    var SPOOFED_LANGS = Object.freeze([SPOOFED_LANG]);
 
     function getAppVersion(ua) {
       if (!ua) return '';
@@ -29,21 +29,30 @@ function __tzGuardWorkerPatch(TARGET_TIMEZONE, TARGET_UA) {
     }
 
     function makeNative(fn, name, length) {
-      length = length || 0;
-      var fnName = name || fn.name || '';
-      var str = 'function ' + fnName + '() {\n    [native code]\n}';
-      var proxy = new Proxy(fn, {
-        construct: function(target, args) {
-          throw new TypeError(fnName + ' is not a constructor');
-        }
-      });
-      Object.defineProperty(proxy, 'toString', { value: function() { return str; }, writable: true, configurable: true });
+  length = length || 0;
+  var fnName = name || fn.name || '';
+  var str = 'function ' + fnName + '() {\n    [native code]\n}';
+  // неконструируемый shorthand-метод вместо Proxy
+  var wrapper = ({ [fnName](...a) { return fn.apply(this, a); } })[fnName];
+  Object.defineProperty(wrapper, 'toString', { value: function() { return str; }, writable: true, configurable: true });
+  try {
+    Object.defineProperty(wrapper, 'name', { value: fnName, configurable: true });
+    Object.defineProperty(wrapper, 'length', { value: length, configurable: true });
+  } catch (e) {}
+  return wrapper;
+}
+
+    function patchNativeLook(fn, name, length) {
+      var str = 'function ' + name + '() {\n    [native code]\n}';
       try {
-        Object.defineProperty(proxy, 'name', { value: fnName, configurable: true });
-        Object.defineProperty(proxy, 'length', { value: length, configurable: true });
+        Object.defineProperty(fn, 'toString', { value: function() { return str; }, writable: true, configurable: true });
+        Object.defineProperty(fn, 'name', { value: name, configurable: true });
+        Object.defineProperty(fn, 'length', { value: length, configurable: true });
       } catch (e) {}
-      return proxy;
+      return fn;
     }
+
+
 
     var OriginalDate = self.Date;
     var OriginalDTF = self.Intl.DateTimeFormat;
@@ -128,6 +137,34 @@ function __tzGuardWorkerPatch(TARGET_TIMEZONE, TARGET_UA) {
     SpoofedNF.supportedLocalesOf = OriginalNF.supportedLocalesOf;
     makeNative(SpoofedNF, 'NumberFormat', 0);
     self.Intl.NumberFormat = SpoofedNF;
+
+    // CreepJS collects resolvedOptions().locale of default-constructed
+    // Intl constructors — every one of them must resolve to SPOOFED_LANG.
+    ['Collator', 'DisplayNames', 'ListFormat', 'PluralRules', 'RelativeTimeFormat'].forEach(function(name) {
+      var OriginalIntlCtor = self.Intl[name];
+      if (typeof OriginalIntlCtor !== 'function') return;
+      function SpoofedIntlCtor(locales, options) {
+        if (!(this instanceof SpoofedIntlCtor)) return new SpoofedIntlCtor(locales, options);
+        if (!locales) locales = SPOOFED_LANG;
+        var inst = new OriginalIntlCtor(locales, options);
+        // SpiderMonkey quirk: Firefox resolves Collator('fi-FI') -> 'fi' (strips the region),
+        // breaking the "one locale" fingerprint. Force the full tag.
+        if (name === 'Collator') {
+          var origRO = inst.resolvedOptions;
+          inst.resolvedOptions = makeNative(function() {
+            var res = origRO.call(inst);
+            try { res.locale = SPOOFED_LANG; } catch (err) {}
+            return res;
+          }, 'resolvedOptions', 0);
+        }
+        return inst;
+      }
+      SpoofedIntlCtor.prototype = OriginalIntlCtor.prototype;
+      try { OriginalIntlCtor.prototype.constructor = SpoofedIntlCtor; } catch(e) {}
+      SpoofedIntlCtor.supportedLocalesOf = OriginalIntlCtor.supportedLocalesOf;
+      makeNative(SpoofedIntlCtor, name, 0);
+      self.Intl[name] = SpoofedIntlCtor;
+    });
 
     var origNumberToLocaleString = self.Number.prototype.toLocaleString;
     self.Number.prototype.toLocaleString = makeNative(function(locales, options) {
@@ -249,7 +286,7 @@ function __tzGuardWorkerPatch(TARGET_TIMEZONE, TARGET_UA) {
     PatchedDate.now = OriginalDate.now;
     PatchedDate.UTC = OriginalDate.UTC;
     PatchedDate.parse = makeNative(function(str) { return correctedParse(str); }, 'parse', 1);
-    makeNative(PatchedDate, 'Date', 7);
+    patchNativeLook(PatchedDate, 'Date', 7);
     try { Object.defineProperty(self, 'Date', { value: PatchedDate, writable: true, configurable: true }); } catch (e) {}
 
     if (self.Temporal && self.Temporal.Now) {

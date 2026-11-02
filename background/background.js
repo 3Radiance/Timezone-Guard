@@ -10,10 +10,39 @@ const langMap = {
 };
 
 function buildAcceptLanguage(tz) {
-  const lang = langMap[tz] || 'en-US';
-  const base = lang.split('-')[0];
-  if (lang === 'en-US') return 'en-US,en;q=0.9';
-  return `${lang},${base};q=0.9,en-US;q=0.8,en;q=0.7`;
+  // Single language — must exactly mirror navigator.*(language|languages)
+  // of the spoofed locale (creepjs flags header/JS mismatches).
+  return langMap[tz] || 'en-US';
+}
+
+// ============================================================
+// Site whitelist
+// ============================================================
+// Empty whitelist = spoof everywhere (default behaviour).
+// Entries are bare domains ("example.com", without scheme/path/port);
+// the domain itself and all of its subdomains match.
+function hostnameOf(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch (e) {
+    return '';
+  }
+}
+
+function isSiteAllowed(url, whitelist) {
+  if (!Array.isArray(whitelist) || whitelist.length === 0) return true;
+  const host = hostnameOf(url);
+  if (!host) return false;
+  return whitelist.some((entry) => {
+    const e = String(entry).trim().toLowerCase().replace(/^https?:\/\//, '').split(/[/:?#]/)[0].replace(/^\*\.?/, '');
+    if (!e) return false;
+    return host === e || host.endsWith('.' + e);
+  });
+}
+
+// Best guess of the page that initiated the request (falls back to the request URL itself)
+function requestPageUrl(details) {
+  return details.originUrl || details.documentUrl || details.url;
 }
 
 console.log('[TZ-GUARD bg] background.js loaded');
@@ -40,15 +69,16 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message && message.type === 'get-config') {
-    browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders']).then((result) => {
+    browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders', 'whitelist']).then((result) => {
       sendResponse({
         tz: result.tz || '',
         ua: result.ua || '',
         enabled: result.enabled !== false,
-        spoofHeaders: result.spoofHeaders !== false
+        spoofHeaders: result.spoofHeaders !== false,
+        whitelist: Array.isArray(result.whitelist) ? result.whitelist : []
       });
     }).catch(() => {
-      sendResponse({ tz: '', ua: '', enabled: true, spoofHeaders: true });
+      sendResponse({ tz: '', ua: '', enabled: true, spoofHeaders: true, whitelist: [] });
     });
     return true; 
   }
@@ -59,13 +89,14 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 browser.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
 
-  browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders']).then((result) => {
+  browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders', 'whitelist']).then((result) => {
     var cfg = {
       type: 'config-update',
       tz: result.tz || '',
       ua: result.ua || '',
       enabled: result.enabled !== false,
-      spoofHeaders: result.spoofHeaders !== false
+      spoofHeaders: result.spoofHeaders !== false,
+      whitelist: Array.isArray(result.whitelist) ? result.whitelist : []
     };
     browser.tabs.query({}).then((tabs) => {
       for (var i = 0; i < tabs.length; i++) {
@@ -83,11 +114,13 @@ browser.storage.onChanged.addListener((changes, area) => {
 browser.webRequest.onBeforeSendHeaders.addListener(
   async (details) => {
     try {
-      const result = await browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders']);
+      const result = await browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders', 'whitelist']);
       const enabled = result.enabled !== false;
       const spoofHeaders = result.spoofHeaders !== false;
+      const whitelist = Array.isArray(result.whitelist) ? result.whitelist : [];
 
       if (!enabled || !spoofHeaders) return;
+      if (!isSiteAllowed(requestPageUrl(details), whitelist)) return;
 
       const currentTZ = result.tz || 'Atlantic/Reykjavik';
       const currentUA = result.ua || '';
@@ -144,10 +177,17 @@ browser.webRequest.onBeforeSendHeaders.addListener(
 browser.webRequest.onBeforeRequest.addListener(
   async (details) => {
     try {
-      const result = await browser.storage.local.get(['tz', 'ua', 'enabled']);
+      const result = await browser.storage.local.get(['tz', 'ua', 'enabled', 'whitelist']);
       const enabled = result.enabled !== false;
+      const whitelist = Array.isArray(result.whitelist) ? result.whitelist : [];
 
       if (!enabled) return;
+
+      // The SW script itself or the page that registered it must be whitelisted
+      const swAllowed = isSiteAllowed(details.url, whitelist) ||
+        isSiteAllowed(details.originUrl || '', whitelist) ||
+        isSiteAllowed(details.documentUrl || '', whitelist);
+      if (!swAllowed) return;
 
       const matchedByUrl = knownSWUrls.has(details.url);
       const matchedByHeader = pendingSWRequests.has(details.requestId);

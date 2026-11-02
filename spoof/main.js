@@ -19,6 +19,12 @@
     'America/Los_Angeles': 'en-US', 'Asia/Dubai': 'ar-AE', 'Asia/Tokyo': 'ja-JP'
   };
 
+  function spoofLanguagesList(lang) {
+    // Single language only — creepjs flags any extra/secondary languages
+    // in workers (default Firefox exposes exactly one here).
+    return Object.freeze([lang]);
+  }
+
   function getAppVersion(ua) {
     if (!ua) return '';
     if (ua.indexOf('Firefox/') !== -1 || (ua.indexOf('Gecko/') !== -1 && ua.indexOf('Firefox') !== -1)) {
@@ -37,25 +43,28 @@
   }
 
   function makeNative(fn, name, length) {
-    length = length || 0;
-    var fnName = name || fn.name || '';
-    var str = 'function ' + fnName + '() {\n    [native code]\n}';
-    var proxy = new Proxy(fn, {
-      construct: function(target, args) {
-        throw new TypeError(fnName + ' is not a constructor');
-      }
-    });
-    Object.defineProperty(proxy, 'toString', {
-      value: function toString() { return str; },
-      writable: true,
-      configurable: true
-    });
-    try {
-      Object.defineProperty(proxy, 'name', { value: fnName, configurable: true });
-      Object.defineProperty(proxy, 'length', { value: length, configurable: true });
-    } catch (e) {}
-    return proxy;
-  }
+  length = length || 0;
+  var fnName = name || fn.name || '';
+  var str = 'function ' + fnName + '() {\n    [native code]\n}';
+  // неконструируемый shorthand-метод вместо Proxy
+  var wrapper = ({ [fnName](...a) { return fn.apply(this, a); } })[fnName];
+  Object.defineProperty(wrapper, 'toString', { value: function() { return str; }, writable: true, configurable: true });
+  try {
+    Object.defineProperty(wrapper, 'name', { value: fnName, configurable: true });
+    Object.defineProperty(wrapper, 'length', { value: length, configurable: true });
+  } catch (e) {}
+  return wrapper;
+}
+
+function patchNativeLook(fn, name, length) {
+  var str = 'function ' + name + '() {\n    [native code]\n}';
+  try {
+    Object.defineProperty(fn, 'toString', { value: function() { return str; }, writable: true, configurable: true });
+    Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    Object.defineProperty(fn, 'length', { value: length, configurable: true });
+  } catch (e) {}
+  return fn;
+}
 
   // ============================================================
   // Worker patch (self-contained, serialized into workers)
@@ -69,7 +78,7 @@
         'America/Los_Angeles': 'en-US', 'Asia/Dubai': 'ar-AE', 'Asia/Tokyo': 'ja-JP'
       };
       var SPOOFED_LANG = langMap[TARGET_TIMEZONE] || 'en-US';
-      var SPOOFED_LANGS = Object.freeze([SPOOFED_LANG, 'en-US']);
+      var SPOOFED_LANGS = Object.freeze([SPOOFED_LANG]);
 
       function getAppVersion(ua) {
         if (!ua) return '';
@@ -89,21 +98,19 @@
       }
 
       function makeNative(fn, name, length) {
-        length = length || 0;
-        var fnName = name || fn.name || '';
-        var str = 'function ' + fnName + '() {\n    [native code]\n}';
-        var proxy = new Proxy(fn, {
-          construct: function(target, args) {
-            throw new TypeError(fnName + ' is not a constructor');
-          }
-        });
-        Object.defineProperty(proxy, 'toString', { value: function() { return str; }, writable: true, configurable: true });
-        try {
-          Object.defineProperty(proxy, 'name', { value: fnName, configurable: true });
-          Object.defineProperty(proxy, 'length', { value: length, configurable: true });
-        } catch (e) {}
-        return proxy;
-      }
+  length = length || 0;
+  var fnName = name || fn.name || '';
+  var str = 'function ' + fnName + '() {\n    [native code]\n}';
+  // неконструируемый shorthand-метод вместо Proxy
+  var wrapper = ({ [fnName](...a) { return fn.apply(this, a); } })[fnName];
+  Object.defineProperty(wrapper, 'toString', { value: function() { return str; }, writable: true, configurable: true });
+  try {
+    Object.defineProperty(wrapper, 'name', { value: fnName, configurable: true });
+    Object.defineProperty(wrapper, 'length', { value: length, configurable: true });
+  } catch (e) {}
+  return wrapper;
+}
+
 
       var OriginalDate = self.Date;
       var OriginalDTF = self.Intl.DateTimeFormat;
@@ -192,6 +199,34 @@
       SpoofedNF.supportedLocalesOf = OriginalNF.supportedLocalesOf;
       makeNative(SpoofedNF, 'NumberFormat', 0);
       self.Intl.NumberFormat = SpoofedNF;
+
+      // CreepJS collects resolvedOptions().locale of default-constructed
+      // Intl constructors — every one of them must resolve to SPOOFED_LANG.
+      ['Collator', 'DisplayNames', 'ListFormat', 'PluralRules', 'RelativeTimeFormat'].forEach(function(name) {
+        var OriginalIntlCtor = self.Intl[name];
+        if (typeof OriginalIntlCtor !== 'function') return;
+        function SpoofedIntlCtor(locales, options) {
+          if (!(this instanceof SpoofedIntlCtor)) return new SpoofedIntlCtor(locales, options);
+          if (!locales) locales = SPOOFED_LANG;
+          var inst = new OriginalIntlCtor(locales, options);
+          // SpiderMonkey quirk: Firefox resolves Collator('fi-FI') -> 'fi' (strips the region),
+          // breaking the "one locale" fingerprint. Force the full tag.
+          if (name === 'Collator') {
+            var origRO = inst.resolvedOptions;
+            inst.resolvedOptions = makeNative(function() {
+              var res = origRO.call(inst);
+              try { res.locale = SPOOFED_LANG; } catch (err) {}
+              return res;
+            }, 'resolvedOptions', 0);
+          }
+          return inst;
+        }
+        SpoofedIntlCtor.prototype = OriginalIntlCtor.prototype;
+        try { OriginalIntlCtor.prototype.constructor = SpoofedIntlCtor; } catch(e) {}
+        SpoofedIntlCtor.supportedLocalesOf = OriginalIntlCtor.supportedLocalesOf;
+        makeNative(SpoofedIntlCtor, name, 0);
+        self.Intl[name] = SpoofedIntlCtor;
+      });
 
       var origNumberToLocaleString = self.Number.prototype.toLocaleString;
       self.Number.prototype.toLocaleString = makeNative(function(locales, options) {
@@ -322,7 +357,7 @@
       PatchedDate.now = OriginalDate.now;
       PatchedDate.UTC = OriginalDate.UTC;
       PatchedDate.parse = makeNative(function(str) { return correctedParse(str); }, 'parse', 1);
-      makeNative(PatchedDate, 'Date', 7);
+      patchNativeLook(PatchedDate, 'Date', 7);
       try { Object.defineProperty(self, 'Date', { value: PatchedDate, writable: true, configurable: true }); } catch (e) {}
 
       if (self.Temporal && self.Temporal.Now) {
@@ -451,8 +486,7 @@
       spoofedWindows.add(NavigatorProto);
 
       var spoofedLang = langMap[TARGET_TIMEZONE] || 'en-US';
-      var spoofedLangsArr = [spoofedLang, 'en-US'];
-      Object.freeze(spoofedLangsArr);
+      var spoofedLangsArr = spoofLanguagesList(spoofedLang);
 
       var langProps = {
         language: spoofedLang,
@@ -622,6 +656,34 @@
       makeNative(SpoofedNF, 'NumberFormat', 0);
       win.Intl.NumberFormat = SpoofedNF;
 
+      // CreepJS collects resolvedOptions().locale of default-constructed
+      // Intl constructors — every one of them must resolve to SPOOFED_LANG.
+      ['Collator', 'DisplayNames', 'ListFormat', 'PluralRules', 'RelativeTimeFormat'].forEach(function(name) {
+        var OriginalIntlCtor = win.Intl[name];
+        if (typeof OriginalIntlCtor !== 'function') return;
+        function SpoofedIntlCtor(locales, options) {
+          if (!(this instanceof SpoofedIntlCtor)) return new SpoofedIntlCtor(locales, options);
+          if (!locales) locales = SPOOFED_LANG;
+          var inst = new OriginalIntlCtor(locales, options);
+          // SpiderMonkey quirk: Firefox resolves Collator('fi-FI') -> 'fi' (strips the region),
+          // breaking the "one locale" fingerprint. Force the full tag.
+          if (name === 'Collator') {
+            var origRO = inst.resolvedOptions;
+            inst.resolvedOptions = makeNative(function() {
+              var res = origRO.call(inst);
+              try { res.locale = SPOOFED_LANG; } catch (err) {}
+              return res;
+            }, 'resolvedOptions', 0);
+          }
+          return inst;
+        }
+        SpoofedIntlCtor.prototype = OriginalIntlCtor.prototype;
+        try { OriginalIntlCtor.prototype.constructor = SpoofedIntlCtor; } catch(e) {}
+        SpoofedIntlCtor.supportedLocalesOf = OriginalIntlCtor.supportedLocalesOf;
+        makeNative(SpoofedIntlCtor, name, 0);
+        win.Intl[name] = SpoofedIntlCtor;
+      });
+
       var origNumberToLocaleString = win.Number.prototype.toLocaleString;
       win.Number.prototype.toLocaleString = makeNative(function(locales, options) {
         if (!locales) locales = SPOOFED_LANG;
@@ -739,7 +801,7 @@
       PatchedDate.now = OriginalDate.now;
       PatchedDate.UTC = OriginalDate.UTC;
       PatchedDate.parse = makeNative(function(str) { return correctedParse(str); }, 'parse', 1);
-      makeNative(PatchedDate, 'Date', 7);
+      patchNativeLook(PatchedDate, 'Date', 7);
       try { Object.defineProperty(win, 'Date', { value: PatchedDate, writable: true, configurable: true }); } catch (e) {}
 
       patchWorkerConstructors(win);
@@ -852,6 +914,38 @@
   // ============================================================
   // Synchronous config read from DOM attributes
   // ============================================================
+  // Frame hostname: about:blank / srcdoc inherit the embedding origin —
+  // fall back to parent/top (same-origin only; SecurityError otherwise).
+  var __currentHostname = (function() {
+    try {
+      var h = window.location && window.location.hostname;
+      if (h) return String(h).toLowerCase();
+    } catch (e) {}
+    try {
+      if (window.parent && window.parent !== window &&
+          window.parent.location && window.parent.location.hostname) {
+        return String(window.parent.location.hostname).toLowerCase();
+      }
+      if (window.top && window.top.location && window.top.location.hostname) {
+        return String(window.top.location.hostname).toLowerCase();
+      }
+    } catch (e) {}
+    return '';
+  })();
+
+  // Must stay in sync with bridge.js / background.js (same matching rules)
+  function isSiteAllowed(hostname, whitelist) {
+    if (!Array.isArray(whitelist) || whitelist.length === 0) return true;
+    var host = String(hostname || '').toLowerCase();
+    if (!host) return false;
+    for (var i = 0; i < whitelist.length; i++) {
+      var e = String(whitelist[i]).trim().toLowerCase().replace(/^https?:\/\//, '').split(/[/:?#]/)[0].replace(/^\*\.?/, '');
+      if (!e) continue;
+      if (host === e || host.slice(-(e.length + 1)) === '.' + e) return true;
+    }
+    return false;
+  }
+
   function readConfigFromDOM() {
     var tz = document.documentElement.getAttribute('data-tz-guard-tz') || '';
     var ua = document.documentElement.getAttribute('data-tz-guard-ua') || '';
@@ -871,10 +965,14 @@
                || window.localStorage.getItem('__tzGuardConfig');
         if (raw) {
             var cfg = JSON.parse(raw);
+            // Legacy configs (before the whitelist feature) carry no whitelist —
+            // never trust them, they may spoof non-whitelisted sites.
+            if (!Array.isArray(cfg.whitelist)) return null;
+            var allowed = isSiteAllowed(__currentHostname, cfg.whitelist);
             return {
                 tz: cfg.tz || '',
                 ua: cfg.ua || '',
-                enabled: cfg.enabled !== false,
+                enabled: cfg.enabled !== false && allowed,
                 spoofHeaders: cfg.spoofHeaders !== false
             };
         }
@@ -922,10 +1020,18 @@
     }
   }
 
-  // Always patch Worker constructors immediately so they catch up when config arrives
-  patchWorkerConstructors(window);
-  patchServiceWorkerRegister(window);
-  patchIframeGetters(window);
+  // Wrap constructors only when the site is (or may be) allowed:
+  // on known-disallowed origins the environment stays 100% pristine,
+  // because even a transparent-looking wrapper is detectable.
+  var knownAllowed = (
+    hasDOMConfig ? (domCfg.enabled !== false) :
+      storageCfg ? (storageCfg.enabled !== false) : null
+  );
+  if (knownAllowed !== false) {
+    patchWorkerConstructors(window);
+    patchServiceWorkerRegister(window);
+    patchIframeGetters(window);
+  }
 
   // ============================================================
   // PAGESHOW (bfcache restore): synchronous restore, no browser API
@@ -939,13 +1045,14 @@
       patchedIframeProtos = new WeakSet();
       hasAppliedPatches = false;
 
-      // Re-apply immediate patches
-      patchWorkerConstructors(window);
-      patchServiceWorkerRegister(window);
-      patchIframeGetters(window);
-
       // Synchronous restore from DOM attributes (they survived bfcache)
       var cfg = readConfigFromDOM();
+      // Re-apply immediate patches only when the site is allowed
+      if (cfg.enabled !== false) {
+        patchWorkerConstructors(window);
+        patchServiceWorkerRegister(window);
+        patchIframeGetters(window);
+      }
       applyConfig(cfg);
     }
   });
