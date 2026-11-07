@@ -1,49 +1,103 @@
 (function() {
 
-  // Frame hostname resolution: about:blank / srcdoc frames have an empty
-  // location.hostname but INHERIT the embedding origin — fall back to the
-  // parent/top frame (same-origin access only; SecurityError otherwise).
-  function resolveFrameHostname() {
+  // ============================================================
+  // Host chain resolution (per-frame decision)
+  // ============================================================
+  // Own hostname + all ancestor hostnames. For cross-origin ancestors
+  // location.hostname is NOT readable, but location.href IS (spec
+  // allows reading href across origins) — parse the hostname out of
+  // it. This lets frames spawned by an exception site inherit its
+  // status (e.g. the Cloudflare Turnstile iframe inside an excepted
+  // page stays native automatically).
+  function hostnameFromUrl(u) {
+    try { return new URL(u).hostname.toLowerCase(); } catch (e) { return ''; }
+  }
+
+  function readWinHost(win) {
     try {
-      var h = window.location && window.location.hostname;
+      var h = win.location.hostname;
       if (h) return String(h).toLowerCase();
     } catch (e) {}
     try {
-      if (window.parent && window.parent !== window &&
-          window.parent.location && window.parent.location.hostname) {
-        return String(window.parent.location.hostname).toLowerCase();
-      }
-      if (window.top && window.top.location && window.top.location.hostname) {
-        return String(window.top.location.hostname).toLowerCase();
-      }
-    } catch (e) {}
+      var href = win.location.href;
+      if (href) return hostnameFromUrl(href);
+    } catch (e2) {}
     return '';
   }
 
+  function resolveHostChain() {
+    var hosts = [];
+    var w = window;
+    try {
+      for (var d = 0; d < 16; d++) {
+        var h = readWinHost(w);
+        if (h) hosts.push(h);
+        if (w === w.top) break;
+        var p = w.parent;
+        if (!p || p === w) break;
+        w = p;
+      }
+    } catch (e) {}
+    return hosts;
+  }
+
   // ============================================================
-  // Site whitelist (per-frame decision)
+  // Site exception list (per-frame decision)
   // ============================================================
   // Must stay in sync with background.js isSiteAllowed:
-  // empty whitelist = allowed everywhere; bare domains match
-  // themselves and all subdomains.
-  function isSiteAllowed(hostname, whitelist) {
+  // spoofing is ON everywhere by default; the list is an EXCEPTION
+  // list of sites (plus subdomains) where the environment stays
+  // fully native — and that status is inherited by frames they
+  // spawn and requests they initiate. Empty list = no exceptions.
+  function isSiteAllowed(hosts, whitelist) {
     if (!Array.isArray(whitelist) || whitelist.length === 0) return true;
-    const host = String(hostname || '').toLowerCase();
-    if (!host) return false;
-    return whitelist.some((entry) => {
-      const e = String(entry).trim().toLowerCase().replace(/^https?:\/\//, '').split(/[/:?#]/)[0].replace(/^\*\.?/, '');
-      if (!e) return false;
-      return host === e || host.endsWith('.' + e);
-    });
+    var list = Array.isArray(hosts) ? hosts : [hosts];
+    for (var i = 0; i < list.length; i++) {
+      var host = String(list[i] || '').toLowerCase();
+      if (!host) continue;
+      for (var j = 0; j < whitelist.length; j++) {
+        var e = String(whitelist[j]).trim().toLowerCase().replace(/^https?:\/\//, '').split(/[/:?#]/)[0].replace(/^\*\.?/, '');
+        if (!e) continue;
+        if (host === e || host.endsWith('.' + e)) return false;
+      }
+    }
+    return true;
   }
 
   function applyContent(cfg) {
     const t = cfg.tz || '';
     const u = cfg.ua || '';
     const e = cfg.enabled !== false;
-    // Extension only acts on whitelisted sites for this frame
+    // Spoofing is disabled on exception (listed) sites for this frame
     const allowed = cfg.siteAllowed !== false;
     const effectiveEnabled = e && allowed;
+    const root = document.documentElement;
+
+    if (!effectiveEnabled) {
+      // ALWAYS signal the current state (master toggle off or exception
+      // site). The cached page-storage cfg could otherwise be a stale
+      // "enabled" record from a previous visit and resurrect the spoof
+      // on reload — so overwrite it with a neutral disabled marker.
+      try {
+        root.setAttribute('data-tz-guard-enabled', 'false');
+      } catch (err) {}
+      try {
+        var offStr = JSON.stringify({
+          tz: '', ua: '', enabled: false, spoofHeaders: true,
+          whitelist: Array.isArray(cfg.whitelist) ? cfg.whitelist : []
+        });
+        window.sessionStorage.setItem('__tzGuardConfig', offStr);
+        window.localStorage.setItem('__tzGuardConfig', offStr);
+      } catch (err2) {}
+
+      root.dispatchEvent(new CustomEvent('tz-guard-update-config', {
+        detail: JSON.stringify({
+          tz: '', ua: '', enabled: false, spoofHeaders: true,
+          whitelist: Array.isArray(cfg.whitelist) ? cfg.whitelist : []
+        })
+      }));
+      return;
+    }
 
     try {
         var cfgStr = JSON.stringify({
@@ -55,18 +109,22 @@
         window.localStorage.setItem('__tzGuardConfig', cfgStr);
     } catch(err) {}
 
-    if (t && effectiveEnabled) {
-        document.documentElement.setAttribute('data-tz-guard-tz', t);
+    if (t) {
+        root.setAttribute('data-tz-guard-tz', t);
     } else {
-        document.documentElement.removeAttribute('data-tz-guard-tz');
+        root.removeAttribute('data-tz-guard-tz');
     }
 
-    document.documentElement.setAttribute('data-tz-guard-ua', effectiveEnabled ? u : '');
-    document.documentElement.setAttribute('data-tz-guard-enabled', String(effectiveEnabled));
-    document.documentElement.setAttribute('data-tz-guard-spoof-headers', String(cfg.spoofHeaders !== false));
+    root.setAttribute('data-tz-guard-ua', u);
+    root.setAttribute('data-tz-guard-enabled', 'true');
+    root.setAttribute('data-tz-guard-spoof-headers', String(cfg.spoofHeaders !== false));
 
-    document.documentElement.dispatchEvent(new CustomEvent('tz-guard-update-config', {
-      detail: JSON.stringify({ tz: t, ua: u, enabled: effectiveEnabled, spoofHeaders: cfg.spoofHeaders !== false })
+    root.dispatchEvent(new CustomEvent('tz-guard-update-config', {
+      detail: JSON.stringify({
+        tz: t, ua: u, enabled: true,
+        spoofHeaders: cfg.spoofHeaders !== false,
+        whitelist: Array.isArray(cfg.whitelist) ? cfg.whitelist : []
+      })
     }));
   }
 
@@ -82,7 +140,7 @@
     applyContent({
       tz, ua, enabled, spoofHeaders,
       whitelist: currentWhitelist,
-      siteAllowed: isSiteAllowed(resolveFrameHostname(), whitelist)
+      siteAllowed: isSiteAllowed(resolveHostChain(), whitelist)
     });
   }).catch(() => {});
 
@@ -96,16 +154,15 @@
         enabled: message.enabled,
         spoofHeaders: message.spoofHeaders,
         whitelist: currentWhitelist,
-        siteAllowed: isSiteAllowed(resolveFrameHostname(), message.whitelist)
+        siteAllowed: isSiteAllowed(resolveHostChain(), message.whitelist)
       });
     }
   });
 
   
   document.documentElement.addEventListener('tz-guard-sw-register', (e) => {
-    if (currentWhitelist && currentWhitelist.length > 0 &&
-        !isSiteAllowed(resolveFrameHostname(), currentWhitelist)) {
-      return; // never track SW URLs of non-whitelisted sites
+    if (!isSiteAllowed(resolveHostChain(), currentWhitelist)) {
+      return; // never track SW URLs of exception (listed) sites
     }
     try {
       browser.runtime.sendMessage({ type: 'tz-guard-sw-register', url: e.detail });

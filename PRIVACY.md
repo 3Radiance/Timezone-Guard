@@ -23,8 +23,8 @@ The extension stores the following information locally on your device using the 
 
 To transfer settings between the extension's isolated world and the page's main world, the extension uses:
 
-- **DOM attributes** on the `<html>` element (read immediately at `document_start` and removed).
-- **`sessionStorage` and `localStorage`** keys (`__tzGuardConfig`) — used as a fallback to survive page reloads and bfcache restores.
+- **DOM attributes** on the `<html>` element (read immediately at `document_start`; removed right away on disabled/exception sites, and retained only as long as needed for bfcache restores on spoofed sites).
+- **`sessionStorage` and `localStorage`** keys (`__tzGuardConfig`) — a fallback to survive page reloads and bfcache restores. On disabled/exception sites only a neutral record (`{enabled: false, whitelist}` — no timezone or UA values) is written, so a stale cache can never resurrect the spoof; the current whitelist is included so the exception rules stay authentic.
 
 This data is written to the page's own storage and is never transmitted externally.
 

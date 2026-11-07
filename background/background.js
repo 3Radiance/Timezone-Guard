@@ -16,11 +16,19 @@ function buildAcceptLanguage(tz) {
 }
 
 // ============================================================
-// Site whitelist
+// Site exception list
 // ============================================================
-// Empty whitelist = spoof everywhere (default behaviour).
-// Entries are bare domains ("example.com", without scheme/path/port);
-// the domain itself and all of its subdomains match.
+// Spoofing is ON everywhere by default. The list is an EXCEPTION
+// list: entries are bare domains ("example.com", without
+// scheme/path/port) whose sites — themselves and all subdomains —
+// stay completely native. Empty list = no exceptions.
+//
+// Inheritance: the exception status of a site extends to EVERYTHING
+// it spawns — frames it embeds (like the Cloudflare Turnstile
+// iframe) and network requests it (or its frames) initiate. For that
+// we keep a per-tab frame registry and reconstruct each request's
+// ancestor chain; an exception site anywhere in the chain disables
+// the extension for the request.
 function hostnameOf(url) {
   try {
     return new URL(url).hostname.toLowerCase();
@@ -29,21 +37,84 @@ function hostnameOf(url) {
   }
 }
 
-function isSiteAllowed(url, whitelist) {
-  if (!Array.isArray(whitelist) || whitelist.length === 0) return true;
-  const host = hostnameOf(url);
-  if (!host) return false;
-  return whitelist.some((entry) => {
-    const e = String(entry).trim().toLowerCase().replace(/^https?:\/\//, '').split(/[/:?#]/)[0].replace(/^\*\.?/, '');
-    if (!e) return false;
-    return host === e || host.endsWith('.' + e);
-  });
+// Frame registry: "tabId:frameId" → { url: document URL of that frame,
+// parentFrameId }. Rebuilt on every main-frame navigation.
+const frameTree = new Map();
+// Top-level document URL per tab (fallback for requests without frame info)
+const topDocs = new Map();
+
+function noteRequestContext(details) {
+  if (details.tabId === undefined || details.tabId === null || details.tabId === -1) return;
+  const tabKey = String(details.tabId);
+  if (details.type === 'main_frame') {
+    topDocs.set(details.tabId, details.url);
+    for (const key of frameTree.keys()) {
+      if (key.startsWith(tabKey + ':')) frameTree.delete(key);
+    }
+    frameTree.set(tabKey + ':0', { url: details.url, parentFrameId: -1 });
+  } else if (details.type === 'sub_frame' && details.frameId > 0) {
+    frameTree.set(tabKey + ':' + details.frameId, {
+      url: details.url,
+      parentFrameId: details.parentFrameId
+    });
+  }
 }
 
-// Best guess of the page that initiated the request (falls back to the request URL itself)
-function requestPageUrl(details) {
-  return details.originUrl || details.documentUrl || details.url;
+// All hostnames involved in a request: request URL, containing document,
+// initiator, the tab's top document, and every ancestor frame in between
+// (walked through the registry via parentFrameId).
+function involvedHosts(details) {
+  const hosts = [];
+  const push = (u) => {
+    const h = hostnameOf(u);
+    if (h) hosts.push(h);
+  };
+  push(details.url);
+  push(details.documentUrl);
+  push(details.originUrl);
+  if (details.tabId !== undefined && details.tabId !== -1) {
+    push(topDocs.get(details.tabId));
+    let frameId = details.parentFrameId;
+    const tabKey = String(details.tabId);
+    let depth = 0;
+    while (Number.isInteger(frameId) && frameId >= 0 && depth < 16) {
+      const entry = frameTree.get(tabKey + ':' + frameId);
+      if (!entry) break;
+      push(entry.url);
+      frameId = entry.parentFrameId;
+      depth++;
+    }
+  }
+  return hosts;
 }
+
+function matchesExceptionEntry(host, whitelist) {
+  for (const entry of whitelist) {
+    const e = String(entry).trim().toLowerCase().replace(/^https?:\/\//, '').split(/[/:?#]/)[0].replace(/^\*\.?/, '');
+    if (!e) continue;
+    if (host === e || host.endsWith('.' + e)) return true;
+  }
+  return false;
+}
+
+// True = extension may act on this request; false = it touches an
+// exception site anywhere in its origin chain (inheritance rule).
+function isSiteAllowed(details, whitelist) {
+  if (!Array.isArray(whitelist) || whitelist.length === 0) return true;
+  const hosts = involvedHosts(details);
+  for (const host of hosts) {
+    if (matchesExceptionEntry(host, whitelist)) return false;
+  }
+  return true;
+}
+// Registry cleanup: frames and top documents of closed tabs
+browser.tabs.onRemoved.addListener((tabId) => {
+  topDocs.delete(tabId);
+  const tabKey = String(tabId) + ':';
+  for (const key of frameTree.keys()) {
+    if (key.startsWith(tabKey)) frameTree.delete(key);
+  }
+});
 
 console.log('[TZ-GUARD bg] background.js loaded');
 
@@ -114,13 +185,15 @@ browser.storage.onChanged.addListener((changes, area) => {
 browser.webRequest.onBeforeSendHeaders.addListener(
   async (details) => {
     try {
+      noteRequestContext(details);
       const result = await browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders', 'whitelist']);
       const enabled = result.enabled !== false;
       const spoofHeaders = result.spoofHeaders !== false;
       const whitelist = Array.isArray(result.whitelist) ? result.whitelist : [];
 
       if (!enabled || !spoofHeaders) return;
-      if (!isSiteAllowed(requestPageUrl(details), whitelist)) return;
+      // Skip for exception sites AND anything they spawned/imiated
+      if (!isSiteAllowed(details, whitelist)) return;
 
       const currentTZ = result.tz || 'Atlantic/Reykjavik';
       const currentUA = result.ua || '';
@@ -160,6 +233,7 @@ browser.webRequest.onBeforeSendHeaders.addListener(
 // Detect Service Worker script requests
 browser.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
+    noteRequestContext(details);
     const isServiceWorkerScript = (details.requestHeaders || []).some(
       (h) => h.name.toLowerCase() === 'service-worker' && h.value === 'script'
     );
@@ -177,17 +251,16 @@ browser.webRequest.onBeforeSendHeaders.addListener(
 browser.webRequest.onBeforeRequest.addListener(
   async (details) => {
     try {
+      noteRequestContext(details);
       const result = await browser.storage.local.get(['tz', 'ua', 'enabled', 'whitelist']);
       const enabled = result.enabled !== false;
       const whitelist = Array.isArray(result.whitelist) ? result.whitelist : [];
 
       if (!enabled) return;
 
-      // The SW script itself or the page that registered it must be whitelisted
-      const swAllowed = isSiteAllowed(details.url, whitelist) ||
-        isSiteAllowed(details.originUrl || '', whitelist) ||
-        isSiteAllowed(details.documentUrl || '', whitelist);
-      if (!swAllowed) return;
+      // Skip if the SW script, its registering page, or any ancestor
+      // in the frame chain belongs to an exception site (inheritance)
+      if (!isSiteAllowed(details, whitelist)) return;
 
       const matchedByUrl = knownSWUrls.has(details.url);
       const matchedByHeader = pendingSWRequests.has(details.requestId);

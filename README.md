@@ -15,7 +15,7 @@ Websites infer approximate location and browser characteristics via `Intl.DateTi
 - **Time zone spoofing** — `Intl.DateTimeFormat`, `Date.prototype.getTimezoneOffset`, `toString` / `toDateString` / `toTimeString` / `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString`
 - **Optional User-Agent spoofing** — `navigator.userAgent`, `appVersion`, `platform`, `vendor`, `language`, `languages`, `maxTouchPoints`, `oscpu` (Firefox), and related properties
 - **HTTP header spoofing** — optionally modifies outgoing `Accept-Language` and `User-Agent` headers to match the selected timezone and browser identifier
-- **Site whitelist** — restrict spoofing to the sites you list (one domain per line in the popup, subdomains included); an empty list spoofs everywhere as before. On non-whitelisted sites the environment stays completely native — nothing is wrapped, nothing is modified
+- **Site exceptions** — spoofing is ON everywhere by default; the sites you list (one domain per line in the popup, subdomains included) are *exceptions* where the environment stays completely native — nothing is wrapped, nothing is modified. An empty list spoofs everywhere as before
 - **Full context coverage** — main window, iframe (including nested iframe-within-iframe and `about:blank`/`srcdoc` frames), Dedicated Worker, Shared Worker, Service Worker
 - **Consistent locale identity** — the default locale of every Intl API (`DateTimeFormat`, `NumberFormat`, `Collator`, `DisplayNames`, `PluralRules`, `ListFormat`, `RelativeTimeFormat`) resolves to the spoofed timezone's language; the global `Date` object passes native-look checks (`toString`, `name`, `length`)
 - **Real system clock untouched** — `Date.now()` and the actual OS clock are not modified; only how the date is *interpreted and displayed* in the chosen time zone is changed
@@ -40,7 +40,7 @@ A single content script injected by the browser directly into the page's main wo
 
 ### `bridge.js` (isolated world)
 
-Reads saved `tz` / `ua` / `enabled` / `spoofHeaders` / `whitelist` from `browser.storage.local` and passes them to `main.js` through three mechanisms:
+Reads saved `tz` / `ua` / `enabled` / `spoofHeaders` / `whitelist` (the storage key is historical — it holds the exception list) from `browser.storage.local` and passes them to `main.js` through three mechanisms:
 1. **DOM attributes** on `<html>` — available immediately at `document_start`.
 2. **`sessionStorage` / `localStorage`** fallback (`__tzGuardConfig`) — survives page reloads and bfcache restores.
 3. **`CustomEvent`** (`tz-guard-update-config`) — for live updates when settings change in the popup.
@@ -59,15 +59,22 @@ When **"Spoof HTTP Headers"** is enabled in the popup, the extension modifies ou
 - **`Accept-Language`** — a single language tag derived from the selected timezone's language (e.g., `Europe/Moscow` → `ru-RU`), exactly matching the spoofed `navigator.languages`
 - **`User-Agent`** — set to the custom UA if provided
 
-### Site Whitelist
+### Site exceptions
 
-The whitelist is enforced at every layer, so a non-whitelisted site cannot observe a single trace of the extension:
+The exception list is enforced at every layer — an excluded (listed) site cannot observe a single trace of the extension, while every other site is spoofed exactly as before:
 
-- **Background** — header rewriting and Service Worker patch injection are skipped for origins not on the list (`isSiteAllowed` / `requestPageUrl`)
+- **Background** — header rewriting and Service Worker patch injection are skipped for excluded origins (`isSiteAllowed` / `requestPageUrl`)
 - **Per frame** — `bridge.js` resolves each frame's hostname (including `about:blank` / `srcdoc` frames, which inherit the embedding origin) and decides independently
-- **Main world** — `spoof/main.js` reads the per-origin cached config synchronously at `document_start`; if the origin is known to be disallowed, not even the `Worker`/`SharedWorker` constructors are wrapped — the page sees a byte-for-byte native environment
+- **Main world** — `spoof/main.js` reads the per-origin cached config synchronously at `document_start`; if the origin is a known exception site, not even the `Worker`/`SharedWorker` constructors are wrapped — the page sees a byte-for-byte native environment. On exception sites `bridge.js` also writes nothing to the page's `sessionStorage`/`localStorage`, sets no injection attributes on `<html>` and dispatches no custom events — zero traces left in the page
 
-Matching rules (kept identical in all three copies): lowercase, scheme/path/port stripped, a bare domain `example.com` matches `example.com` itself and any `*.example.com` subdomain.
+**Inheritance rule** — an exception site's status extends to everything it spawns:
+
+- **Frames it embeds** receive the exception status automatically (e.g. the Cloudflare Turnstile iframe `challenges.cloudflare.com` inside an excepted page stays native — no need to list it manually). For cross-origin ancestors, `location.href` — the one location property readable across origins per spec — is parsed for the hostname, so nothing new is exposed to the page
+- **Network requests** (headers, Service Worker patching) are likewise skipped if any ancestor in the request's origin chain — containing document, initiator or any parent frame — belongs to an exception site. The background rebuilds each request's frame chain from its per-tab frame registry
+
+Direct subdomains (`*.example.com`) are always matched; unrelated sites stay untouched.
+
+Matching rules (kept identical in all copies): lowercase, scheme/path/port stripped, a bare domain `example.com` matches `example.com` itself and any `*.example.com` subdomain.
 
 ## Popup settings
 
@@ -75,7 +82,7 @@ Matching rules (kept identical in all three copies): lowercase, scheme/path/port
 - **Spoof HTTP Headers** — toggles modification of outgoing `Accept-Language` and `User-Agent` headers.
 - **Timezone** — select the timezone to report.
 - **User-Agent** — choose from presets or enter a custom string.
-- **Site Whitelist** — one domain per line; empty = spoof everywhere.
+- **Site Exceptions** — one domain per line; each listed site (and its subdomains) stays fully native; empty = spoof everywhere.
 
 ## Installation (development / temporary extension)
 
@@ -109,8 +116,8 @@ icons/
 
 - **Indexed access `window[n]` / `window.frames[n]`** — numeric index access is exotic internal `WindowProxy` behavior, not an ordinary JS property. `Object.defineProperty` cannot intercept it. The first such access returns real data; subsequent accesses through `.contentWindow` are already patched.
 - **"Dead" (detached) iframes** — a reference to a removed iframe's window, obtained through a non-standard access path, may remain unpatched.
-- **Live updates require reload** — after changing tz/ua in the popup, open tabs must be reloaded. The spoof is applied at page load time, not retroactively (although an already open tab will pick up new values for future API calls if the popup was opened before the page reload).
-- **Whitelist changes need a reload too** — pages that were already open when the whitelist was edited keep their patched state until the tab is reloaded; content scripts cannot be un-patched retroactively.
+- **Live config changes** — settings changes are broadcast live to open tabs. Disabling the extension (toggle or adding a site to exceptions) fully unwraps all already-patched APIs — the page returns to a pristine native state without a reload. Enabling/other changes apply at event arrival; a page reload is still the guaranteed way to start in the new state from the very first script.
+- **Exception list changes need a reload too** — pages that were already open when the list was edited keep their patched state until the tab is reloaded; content scripts cannot be un-patched retroactively.
 - **OS clock untouched** — the extension only changes what is *reported* through JS APIs and HTTP headers. The operating system clock and time zone are not modified.
 
 ## Comparison (Before / After)

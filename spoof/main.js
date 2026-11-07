@@ -13,6 +13,24 @@
   var patchedIframeProtos = new WeakSet();
   var iframeObserver = null;
 
+  // Saved natives for FULL "off" restoration (master toggle / exception
+  // sites): whenever a patch replaces something, the original is recorded
+  // here so a disable event can undo every patch in one shot.
+  var workerRestores = [];   // { win, ctorName, original }
+  var swRestores = [];       // { sw, descriptor }
+  var iframeRestores = [];   // { proto, cwDescriptor, cdDescriptor }
+  var temporalRestores = []; // { obj, prop, descriptor }
+  var navigatorOriginalDescs = new Map(); // NavigatorProto -> { prop: descriptor }
+  var propertyRestores = []; // { obj, prop, descriptor } — generic replaced props
+
+  // Capture the current (native) descriptor of a property BEFORE it is
+  // replaced, so restoreNativePatches() can put the exact original back.
+  function recordReplace(obj, prop) {
+    try {
+      propertyRestores.push({ obj: obj, prop: prop, descriptor: Object.getOwnPropertyDescriptor(obj, prop) });
+    } catch (e) {}
+  }
+
   var langMap = {
     'Europe/Helsinki': 'fi-FI', 'Europe/Moscow': 'ru-RU', 'Europe/London': 'en-GB',
     'Europe/Berlin': 'de-DE', 'Europe/Kyiv': 'uk-UA', 'America/New_York': 'en-US',
@@ -416,6 +434,10 @@ function patchNativeLook(fn, name, length) {
       if (!sw || spoofedSWs.has(sw)) return;
       spoofedSWs.add(sw);
 
+      var swDesc = null;
+      try { swDesc = Object.getOwnPropertyDescriptor(sw, 'register'); } catch (e0) {}
+      swRestores.push({ sw: sw, descriptor: swDesc });
+
       var originalRegister = sw.register.bind(sw);
       var wrappedRegister = function(scriptURL, options) {
         try {
@@ -437,6 +459,7 @@ function patchNativeLook(fn, name, length) {
       var OriginalCtor = win[ctorName];
       if (!OriginalCtor || spoofedWorkers.has(OriginalCtor)) return;
       spoofedWorkers.add(OriginalCtor);
+      workerRestores.push({ win: win, ctorName: ctorName, original: OriginalCtor });
 
       var WrappedCtor = function(scriptURL, options) {
         try {
@@ -464,12 +487,19 @@ function patchNativeLook(fn, name, length) {
   // ============================================================
   function patchTemporal(win) {
     try {
+      if (!EXTENSION_ENABLED) return;
       if (!win.Temporal || !win.Temporal.Now) return;
       var Now = win.Temporal.Now;
+      var tzDesc = null;
+      try { tzDesc = Object.getOwnPropertyDescriptor(Now, 'timeZoneId'); } catch (e0) {}
+      temporalRestores.push({ obj: Now, prop: 'timeZoneId', descriptor: tzDesc });
       Object.defineProperty(Now, 'timeZoneId', { value: makeNative(function() { return TARGET_TIMEZONE; }, 'timeZoneId', 0), writable: true, configurable: true });
       ['zonedDateTimeISO', 'plainDateISO', 'plainTimeISO', 'plainDateTimeISO'].forEach(function(methodName) {
         var original = Now[methodName];
         if (typeof original !== 'function') return;
+        var methodDesc = null;
+        try { methodDesc = Object.getOwnPropertyDescriptor(Now, methodName); } catch (e1) {}
+        temporalRestores.push({ obj: Now, prop: methodName, descriptor: methodDesc });
         var patched = function(tzLike) { return original.call(Now, tzLike || TARGET_TIMEZONE); };
         Object.defineProperty(Now, methodName, { value: makeNative(patched, methodName, 0), writable: true, configurable: true });
       });
@@ -482,8 +512,20 @@ function patchNativeLook(fn, name, length) {
   function spoofUserAgent(win, force) {
     try {
       var NavigatorProto = win.Navigator.prototype;
-      if (spoofedWindows.has(NavigatorProto) && !force) return;
-      spoofedWindows.add(NavigatorProto);
+      if (!navigatorOriginalDescs.has(NavigatorProto)) {
+        // First patch of this proto: capture native descriptors so the
+        // getters below can fall back to real values on disable, and
+        // restoreNativePatches() can defineProperty everything back.
+        var captured = {};
+        var probeProps = ['language', 'languages', 'userAgent', 'appVersion', 'platform', 'vendor', 'maxTouchPoints', 'oscpu'];
+        for (var pi = 0; pi < probeProps.length; pi++) {
+          var pName = probeProps[pi];
+          var pDesc = null;
+          try { pDesc = Object.getOwnPropertyDescriptor(NavigatorProto, pName); } catch (e0) {}
+          if (pDesc) captured[pName] = pDesc;
+        }
+        navigatorOriginalDescs.set(NavigatorProto, captured);
+      }
 
       var spoofedLang = langMap[TARGET_TIMEZONE] || 'en-US';
       var spoofedLangsArr = spoofLanguagesList(spoofedLang);
@@ -494,7 +536,14 @@ function patchNativeLook(fn, name, length) {
       };
       Object.keys(langProps).forEach(function(prop) {
         var val = langProps[prop];
-        var getter = makeNative(function() { return val; }, prop, 0);
+        var getter = makeNative(function() {
+          if (!EXTENSION_ENABLED) {
+            var d = navigatorOriginalDescs.get(NavigatorProto);
+            if (d && d[prop] && d[prop].get) return d[prop].get.call(this);
+            return val;
+          }
+          return val;
+        }, prop, 0);
         try { Object.defineProperty(NavigatorProto, prop, { get: getter, configurable: true }); } catch (e) {}
       });
 
@@ -526,7 +575,14 @@ function patchNativeLook(fn, name, length) {
 
       Object.keys(uaProps).forEach(function(prop) {
         var val = uaProps[prop];
-        var getter = makeNative(function() { return val; }, prop, 0);
+        var getter = makeNative(function() {
+          if (!EXTENSION_ENABLED) {
+            var d = navigatorOriginalDescs.get(NavigatorProto);
+            if (d && d[prop] && d[prop].get) return d[prop].get.call(this);
+            return val;
+          }
+          return val;
+        }, prop, 0);
         try { Object.defineProperty(NavigatorProto, prop, { get: getter, configurable: true }); } catch (e) {}
       });
     } catch (e) {}
@@ -538,6 +594,7 @@ function patchNativeLook(fn, name, length) {
   function spoofWindow(win) {
     try {
       if (!win || spoofedWindows.has(win)) return;
+      if (!EXTENSION_ENABLED) return;
       spoofedWindows.add(win);
 
       spoofUserAgent(win);
@@ -639,6 +696,7 @@ function patchNativeLook(fn, name, length) {
       try { OriginalDTF.prototype.constructor = SpoofedDTF; } catch(e) {}
       SpoofedDTF.supportedLocalesOf = OriginalDTF.supportedLocalesOf;
       makeNative(SpoofedDTF, 'DateTimeFormat', 0);
+      recordReplace(win.Intl, 'DateTimeFormat');
       win.Intl.DateTimeFormat = SpoofedDTF;
 
       function SpoofedNF(locales, options) {
@@ -654,6 +712,7 @@ function patchNativeLook(fn, name, length) {
       try { OriginalNF.prototype.constructor = SpoofedNF; } catch(e) {}
       SpoofedNF.supportedLocalesOf = OriginalNF.supportedLocalesOf;
       makeNative(SpoofedNF, 'NumberFormat', 0);
+      recordReplace(win.Intl, 'NumberFormat');
       win.Intl.NumberFormat = SpoofedNF;
 
       // CreepJS collects resolvedOptions().locale of default-constructed
@@ -663,6 +722,7 @@ function patchNativeLook(fn, name, length) {
         if (typeof OriginalIntlCtor !== 'function') return;
         function SpoofedIntlCtor(locales, options) {
           if (!(this instanceof SpoofedIntlCtor)) return new SpoofedIntlCtor(locales, options);
+          if (!EXTENSION_ENABLED) return new OriginalIntlCtor(locales, options);
           if (!locales) locales = SPOOFED_LANG;
           var inst = new OriginalIntlCtor(locales, options);
           // SpiderMonkey quirk: Firefox resolves Collator('fi-FI') -> 'fi' (strips the region),
@@ -681,33 +741,47 @@ function patchNativeLook(fn, name, length) {
         try { OriginalIntlCtor.prototype.constructor = SpoofedIntlCtor; } catch(e) {}
         SpoofedIntlCtor.supportedLocalesOf = OriginalIntlCtor.supportedLocalesOf;
         makeNative(SpoofedIntlCtor, name, 0);
+        recordReplace(win.Intl, name);
         win.Intl[name] = SpoofedIntlCtor;
       });
 
       var origNumberToLocaleString = win.Number.prototype.toLocaleString;
+      recordReplace(win.Number.prototype, 'toLocaleString');
       win.Number.prototype.toLocaleString = makeNative(function(locales, options) {
+        if (!EXTENSION_ENABLED) return origNumberToLocaleString.call(this, locales, options);
         if (!locales) locales = SPOOFED_LANG;
         return origNumberToLocaleString.call(this, locales, options);
       }, 'toLocaleString', 0);
 
+      recordReplace(win.Date.prototype, 'getTimezoneOffset');
       win.Date.prototype.getTimezoneOffset = makeNative(function getTimezoneOffset() {
+        if (!EXTENSION_ENABLED) return origGetTZOffset.call(this);
         try { return targetOffsetMinutesAt(OriginalDate, origValueOf.call(this)); } catch(e) { return NaN; }
       }, 'getTimezoneOffset', 0);
 
       var fields = ['FullYear', 'Month', 'Date', 'Day', 'Hours', 'Minutes', 'Seconds', 'Milliseconds'];
       fields.forEach(function(field) {
         var getterName = 'get' + field;
+        var origGetter = OriginalDate.prototype[getterName];
         var utcGetterName = 'getUTC' + field;
+        recordReplace(win.Date.prototype, getterName);
         win.Date.prototype[getterName] = makeNative(function() {
+          if (!EXTENSION_ENABLED) return origGetter.call(this);
           try { return shiftedUTC(origValueOf.call(this))[utcGetterName](); } catch(e) { return NaN; }
         }, getterName, 0);
       });
+      var origGetYear = OriginalDate.prototype.getYear;
+      recordReplace(win.Date.prototype, 'getYear');
       win.Date.prototype.getYear = makeNative(function() {
+        if (!EXTENSION_ENABLED) return origGetYear.call(this);
         try { return shiftedUTC(origValueOf.call(this)).getUTCFullYear() - 1900; } catch(e) { return NaN; }
       }, 'getYear', 0);
 
       function makeSetter(name, argCount, apply) {
+        var origSetter = OriginalDate.prototype[name];
+        recordReplace(win.Date.prototype, name);
         win.Date.prototype[name] = makeNative(function() {
+          if (!EXTENSION_ENABLED) return origSetter.apply(this, arguments);
           var p = currentTargetParts(this);
           apply(p, arguments);
           var newEpoch = localComponentsToEpoch(p.y, p.mo, p.d, p.h, p.mi, p.sec, p.ms);
@@ -722,7 +796,10 @@ function patchNativeLook(fn, name, length) {
       makeSetter('setMinutes', 3, function(p, a) { p.mi = a[0]; if (a.length > 1) p.sec = a[1]; if (a.length > 2) p.ms = a[2]; });
       makeSetter('setSeconds', 2, function(p, a) { p.sec = a[0]; if (a.length > 1) p.ms = a[1]; });
       makeSetter('setMilliseconds', 1, function(p, a) { p.ms = a[0]; });
+      var origSetYear = OriginalDate.prototype.setYear;
+      recordReplace(win.Date.prototype, 'setYear');
       win.Date.prototype.setYear = makeNative(function(y) {
+        if (!EXTENSION_ENABLED) return origSetYear.call(this, y);
         var p = currentTargetParts(this);
         p.y = y < 100 ? 1900 + y : y;
         var newEpoch = localComponentsToEpoch(p.y, p.mo, p.d, p.h, p.mi, p.sec, p.ms);
@@ -733,8 +810,10 @@ function patchNativeLook(fn, name, length) {
       var methods = ['toString', 'toDateString', 'toTimeString', 'toLocaleString', 'toLocaleDateString', 'toLocaleTimeString'];
       methods.forEach(function(methodName) {
         var original = win.Date.prototype[methodName];
+        recordReplace(win.Date.prototype, methodName);
         var patchedMethod = function() {
           var args = Array.from(arguments);
+          if (!EXTENSION_ENABLED) return original.apply(this, args);
           try {
             if (methodName.indexOf('toLocale') === 0) {
               var locales = args[0] || SPOOFED_LANG;
@@ -797,11 +876,13 @@ function patchNativeLook(fn, name, length) {
         return inst;
       }
       PatchedDate.prototype = win.Date.prototype;
+      recordReplace(win.Date.prototype, 'constructor');
       try { win.Date.prototype.constructor = PatchedDate; } catch(e) {}
       PatchedDate.now = OriginalDate.now;
       PatchedDate.UTC = OriginalDate.UTC;
       PatchedDate.parse = makeNative(function(str) { return correctedParse(str); }, 'parse', 1);
       patchNativeLook(PatchedDate, 'Date', 7);
+      recordReplace(win, 'Date');
       try { Object.defineProperty(win, 'Date', { value: PatchedDate, writable: true, configurable: true }); } catch (e) {}
 
       patchWorkerConstructors(win);
@@ -833,17 +914,85 @@ function patchNativeLook(fn, name, length) {
           get: makeNative(function() { var doc = originalContentDocumentGetter.call(this); if (doc && doc.defaultView) { try { spoofWindow(doc.defaultView); } catch (e) {} } return doc; }, 'get contentDocument', 0), configurable: true
         });
       }
+      iframeRestores.push({ proto: IFrameProto, cwDescriptor: cwDescriptor, cdDescriptor: cdDescriptor });
     } catch (e) {}
   }
 
   // ============================================================
-  // Config application
+  // Full "off" restoration: undo every recorded patch so a disabled
+  // frame (master toggle / exception site) returns to a pristine
+  // native state even mid-page.
   // ============================================================
+  function restoreNativePatches() {
+    try {
+      var i;
+      for (i = 0; i < workerRestores.length; i++) {
+        var wr = workerRestores[i];
+        try { wr.win[wr.ctorName] = wr.original; } catch (e) {}
+        try { if (wr.win[wr.ctorName]) wr.win[wr.ctorName].prototype.constructor = wr.original; } catch (e2) {}
+      }
+      for (i = 0; i < swRestores.length; i++) {
+        var sr = swRestores[i];
+        try {
+          if (sr.descriptor) Object.defineProperty(sr.sw, 'register', sr.descriptor);
+          else { try { delete sr.sw.register; } catch (e2) {} }
+        } catch (e) {}
+      }
+      for (i = 0; i < iframeRestores.length; i++) {
+        var ir = iframeRestores[i];
+        try {
+          if (ir.cwDescriptor) Object.defineProperty(ir.proto, 'contentWindow', ir.cwDescriptor);
+        } catch (e) {}
+        try {
+          if (ir.cdDescriptor) Object.defineProperty(ir.proto, 'contentDocument', ir.cdDescriptor);
+        } catch (e) {}
+      }
+      for (i = 0; i < temporalRestores.length; i++) {
+        var tr = temporalRestores[i];
+        try {
+          if (tr.descriptor) Object.defineProperty(tr.obj, tr.prop, tr.descriptor);
+          else { try { delete tr.obj[tr.prop]; } catch (e2) {} }
+        } catch (e) {}
+      }
+      navigatorOriginalDescs.forEach(function(props, proto) {
+        Object.keys(props).forEach(function(prop) {
+          try {
+            if (props[prop]) Object.defineProperty(proto, prop, props[prop]);
+            else { try { delete proto[prop]; } catch (e2) {} }
+          } catch (e) {}
+        });
+      });
+      for (i = propertyRestores.length - 1; i >= 0; i--) {
+        var pr = propertyRestores[i];
+        try {
+          if (pr.descriptor) Object.defineProperty(pr.obj, pr.prop, pr.descriptor);
+          else { try { delete pr.obj[pr.prop]; } catch (e2) {} }
+        } catch (e) {}
+      }
+    } catch (err) {}
+    workerRestores.length = 0;
+    swRestores.length = 0;
+    iframeRestores.length = 0;
+    temporalRestores.length = 0;
+    propertyRestores.length = 0;
+    navigatorOriginalDescs = new Map();
+    spoofedWindows = new WeakSet();
+    spoofedSWs = new WeakSet();
+    spoofedWorkers = new WeakSet();
+    patchedIframeProtos = new WeakSet();
+    hasAppliedPatches = false;
+    TARGET_TIMEZONE = '';
+    TARGET_UA = '';
+  }
+
   function applyConfig(cfg) {
     EXTENSION_ENABLED = cfg.enabled !== false;
     SPOOF_HEADERS = cfg.spoofHeaders !== false;
 
-    if (!EXTENSION_ENABLED) return;
+    if (!EXTENSION_ENABLED) {
+      restoreNativePatches();
+      return;
+    }
 
     var tzChanged = cfg.tz !== TARGET_TIMEZONE;
     var uaChanged = cfg.ua !== TARGET_UA;
@@ -914,36 +1063,60 @@ function patchNativeLook(fn, name, length) {
   // ============================================================
   // Synchronous config read from DOM attributes
   // ============================================================
-  // Frame hostname: about:blank / srcdoc inherit the embedding origin —
-  // fall back to parent/top (same-origin only; SecurityError otherwise).
-  var __currentHostname = (function() {
+  // Host chain: own hostname + all ancestor hostnames. For
+  // cross-origin ancestors location.hostname is NOT readable, but
+  // location.href IS (spec allows reading href across origins) —
+  // parse the hostname out of it. Frames spawned by an exception
+  // site therefore inherit its status automatically.
+  function __hostnameFromUrl(u) {
+    return String(u || '').replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/:?#]/)[0].toLowerCase();
+  }
+
+  function __readWinHost(win) {
     try {
-      var h = window.location && window.location.hostname;
+      var h = win.location.hostname;
       if (h) return String(h).toLowerCase();
     } catch (e) {}
     try {
-      if (window.parent && window.parent !== window &&
-          window.parent.location && window.parent.location.hostname) {
-        return String(window.parent.location.hostname).toLowerCase();
-      }
-      if (window.top && window.top.location && window.top.location.hostname) {
-        return String(window.top.location.hostname).toLowerCase();
-      }
-    } catch (e) {}
+      var href = win.location.href;
+      if (href) return __hostnameFromUrl(href);
+    } catch (e2) {}
     return '';
+  }
+
+  var __hostChain = (function() {
+    var hosts = [];
+    var w = window;
+    try {
+      for (var d = 0; d < 16; d++) {
+        var h = __readWinHost(w);
+        if (h) hosts.push(h);
+        if (w === w.top) break;
+        var p = w.parent;
+        if (!p || p === w) break;
+        w = p;
+      }
+    } catch (err) {}
+    return hosts;
   })();
 
-  // Must stay in sync with bridge.js / background.js (same matching rules)
-  function isSiteAllowed(hostname, whitelist) {
+  // Must stay in sync with bridge.js / background.js (same matching rules).
+  // The list is an EXCEPTION list: spoofing is ON everywhere by default,
+  // and the listed sites (plus their subdomains AND the frames they spawn)
+  // stay completely native — status is inherited down the frame chain.
+  function isSiteAllowed(hosts, whitelist) {
     if (!Array.isArray(whitelist) || whitelist.length === 0) return true;
-    var host = String(hostname || '').toLowerCase();
-    if (!host) return false;
-    for (var i = 0; i < whitelist.length; i++) {
-      var e = String(whitelist[i]).trim().toLowerCase().replace(/^https?:\/\//, '').split(/[/:?#]/)[0].replace(/^\*\.?/, '');
-      if (!e) continue;
-      if (host === e || host.slice(-(e.length + 1)) === '.' + e) return true;
+    var list = Array.isArray(hosts) ? hosts : [hosts];
+    for (var i = 0; i < list.length; i++) {
+      var host = String(list[i] || '').toLowerCase();
+      if (!host) continue;
+      for (var j = 0; j < whitelist.length; j++) {
+        var e = String(whitelist[j]).trim().toLowerCase().replace(/^https?:\/\//, '').split(/[/:?#]/)[0].replace(/^\*\.?/, '');
+        if (!e) continue;
+        if (host === e || host.slice(-(e.length + 1)) === '.' + e) return false;
+      }
     }
-    return false;
+    return true;
   }
 
   function readConfigFromDOM() {
@@ -965,10 +1138,10 @@ function patchNativeLook(fn, name, length) {
                || window.localStorage.getItem('__tzGuardConfig');
         if (raw) {
             var cfg = JSON.parse(raw);
-            // Legacy configs (before the whitelist feature) carry no whitelist —
-            // never trust them, they may spoof non-whitelisted sites.
+            // Legacy configs (before the exception-list feature) carry no whitelist —
+            // never trust them: they may miss exception sites that must stay native.
             if (!Array.isArray(cfg.whitelist)) return null;
-            var allowed = isSiteAllowed(__currentHostname, cfg.whitelist);
+            var allowed = isSiteAllowed(__hostChain, cfg.whitelist);
             return {
                 tz: cfg.tz || '',
                 ua: cfg.ua || '',
@@ -988,40 +1161,51 @@ function patchNativeLook(fn, name, length) {
   var root = document.documentElement;
   var hasDOMConfig = root && root.getAttribute('data-tz-guard-enabled') !== null;
 
+  // Live config channel: attached in ALL cases. The DOM/storage paths are
+  // heuristic caches for the synchronous start; the bridge event is the
+  // authoritative async config (also covers a "real" disable taking over
+  // from a stale cache — restoreNativePatches() undoes any early patches).
+  var bridgeHandler = function(e) {
+    try {
+      var cfg = JSON.parse(e.detail);
+      applyConfig(cfg);
+      // Keep the page-storage cache in sync for the next synchronous start
+      try {
+        var cfgStr = JSON.stringify(cfg);
+        window.sessionStorage.setItem('__tzGuardConfig', cfgStr);
+        window.localStorage.setItem('__tzGuardConfig', cfgStr);
+      } catch (err) {}
+    } catch (err2) {}
+  };
+  if (document.documentElement) {
+    document.documentElement.addEventListener('tz-guard-update-config', bridgeHandler);
+  } else {
+    var checkRoot = setInterval(function() {
+      if (document.documentElement) {
+        clearInterval(checkRoot);
+        document.documentElement.addEventListener('tz-guard-update-config', bridgeHandler);
+      }
+    }, 1);
+  }
+
   if (hasDOMConfig) {
-     applyConfig(domCfg);
+    if (domCfg.enabled === false) {
+      // Disabled / exception site: strip the bridge's injection markers
+      // right away so the page carries no post-load trace.
+      try {
+        root.removeAttribute('data-tz-guard-tz');
+        root.removeAttribute('data-tz-guard-ua');
+        root.removeAttribute('data-tz-guard-enabled');
+        root.removeAttribute('data-tz-guard-spoof-headers');
+      } catch (e) {}
+    }
+    applyConfig(domCfg);
   }  else if (storageCfg) {
     applyConfig(storageCfg);
-  } else {
-    var bridgeHandler = function(e) {
-        try {
-            var cfg = JSON.parse(e.detail);
-            applyConfig(cfg);
-            // Сохраняем в storage для следующих перезагрузок
-            try {
-                var cfgStr = JSON.stringify(cfg);
-                window.sessionStorage.setItem('__tzGuardConfig', cfgStr);
-                window.localStorage.setItem('__tzGuardConfig', cfgStr);
-            } catch(err) {}
-            if (document.documentElement) {
-                document.documentElement.removeEventListener('tz-guard-update-config', bridgeHandler);
-            }
-        } catch (err) {}
-    };
-    if (document.documentElement) {
-        document.documentElement.addEventListener('tz-guard-update-config', bridgeHandler);
-    } else {
-        var checkRoot = setInterval(function() {
-            if (document.documentElement) {
-                clearInterval(checkRoot);
-                document.documentElement.addEventListener('tz-guard-update-config', bridgeHandler);
-            }
-        }, 1);
-    }
   }
 
   // Wrap constructors only when the site is (or may be) allowed:
-  // on known-disallowed origins the environment stays 100% pristine,
+  // on known exception sites the environment stays 100% pristine,
   // because even a transparent-looking wrapper is detectable.
   var knownAllowed = (
     hasDOMConfig ? (domCfg.enabled !== false) :
@@ -1038,6 +1222,12 @@ function patchNativeLook(fn, name, length) {
   // ============================================================
   window.addEventListener('pageshow', function(e) {
     if (e.persisted) {
+      // No injection markers = exception site / globally disabled:
+      // nothing was ever patched, stay pristine on restore.
+      try {
+        if (document.documentElement.getAttribute('data-tz-guard-enabled') === null) return;
+      } catch (err) { return; }
+
       // Reset WeakSets so patches apply again to restored objects
       spoofedWindows = new WeakSet();
       spoofedSWs = new WeakSet();
