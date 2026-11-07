@@ -107,6 +107,57 @@ function isSiteAllowed(details, whitelist) {
   }
   return true;
 }
+
+// ============================================================
+// Per-frame verdict (source of truth for content scripts)
+// ============================================================
+// The bridge (isolated world) cannot read cross-origin ancestors.
+// This background registry can: walk the frame chain for the
+// SENDER's tabId/frameId and evaluate it against the exception
+// list. used by the bridge as the authoritative per-frame verdict.
+function frameVerdict(tabId, frameId, whitelist) {
+  const hosts = [];
+  const push = (u) => {
+    const h = hostnameOf(u);
+    if (h && hosts.indexOf(h) === -1) hosts.push(h);
+  };
+  let chainKnown = true;
+  if (typeof tabId === 'number' && tabId !== -1) {
+    const tabKey = String(tabId);
+    let fid = Number.isInteger(frameId) ? frameId : 0;
+    let depth = 0;
+    while (Number.isInteger(fid) && fid >= 0 && depth < 16) {
+      const entry = frameTree.get(tabKey + ':' + fid);
+      if (!entry) {
+        if (fid === 0) push(topDocs.get(tabId));
+        else chainKnown = false;
+        break;
+      }
+      push(entry.url);
+      fid = entry.parentFrameId;
+      depth++;
+    }
+    push(topDocs.get(tabId));
+  } else {
+    chainKnown = false;
+  }
+  if (!Array.isArray(whitelist) || whitelist.length === 0) {
+    return { allowed: true, known: true };
+  }
+  for (const h of hosts) {
+    if (matchesExceptionEntry(h, whitelist)) {
+      console.log('[TZ-GUARD bg] frame verdict: NATIVE (exception in chain)', tabId, frameId, hosts.join(','));
+      return { allowed: false, known: true };
+    }
+  }
+  // Incomplete chain with a non-empty exception list: fail closed
+  // (stay native) — the frame may belong to an excepted site.
+  if (!chainKnown) {
+    console.log('[TZ-GUARD bg] frame verdict: FAIL-CLOSED (chain incomplete)', tabId, frameId);
+    return { allowed: false, known: false };
+  }
+  return { allowed: true, known: true };
+}
 // Registry cleanup: frames and top documents of closed tabs
 browser.tabs.onRemoved.addListener((tabId) => {
   topDocs.delete(tabId);
@@ -137,6 +188,21 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
       console.log('[TZ-GUARD bg] [Msg] SW URL already known:', message.url);
     }
     return;
+  }
+
+  if (message && message.type === 'tz-guard-frame-verdict') {
+    try {
+      const tabId = sender && sender.tab ? sender.tab.id : undefined;
+      const frameId = sender && sender.frameId !== undefined ? sender.frameId : 0;
+      browser.storage.local.get(['whitelist']).then((res) => {
+        const whitelist = Array.isArray(res.whitelist) ? res.whitelist : [];
+        sendResponse(frameVerdict(tabId, frameId, whitelist));
+      }).catch(() => sendResponse({ allowed: null, known: false }));
+      return true;
+    } catch (e) {
+      sendResponse({ allowed: null, known: false });
+      return;
+    }
   }
 
   if (message && message.type === 'get-config') {

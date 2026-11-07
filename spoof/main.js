@@ -466,7 +466,13 @@ function patchNativeLook(fn, name, length) {
           if (!TARGET_TIMEZONE && !TARGET_UA) {
             return new OriginalCtor(scriptURL, options);
           }
+          // Only rewrite classic http(s) workers: blob:/data: sources must
+          // pass through untouched (their context CSP is not ours to satisfy,
+          // importScripts from blob: fails, and strict challengers break).
           var absoluteURL = new win.URL(scriptURL, win.location.href).href;
+          if (!/^(https?:|wss?:)/i.test(absoluteURL) || (options && options.type === 'module')) {
+            return new OriginalCtor(scriptURL, options);
+          }
           var patchCode = buildWorkerPatchSource(TARGET_TIMEZONE, TARGET_UA);
           var combined = patchCode + '\nimportScripts(' + JSON.stringify(absoluteURL) + ');';
           var blob = new win.Blob([combined], { type: 'application/javascript' });

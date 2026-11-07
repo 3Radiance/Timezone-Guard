@@ -68,7 +68,8 @@
     const t = cfg.tz || '';
     const u = cfg.ua || '';
     const e = cfg.enabled !== false;
-    // Spoofing is disabled on exception (listed) sites for this frame
+    // Per-frame verdict (authoritative source: the background frame
+    // registry, which sees the real frame chain via webRequest).
     const allowed = cfg.siteAllowed !== false;
     const effectiveEnabled = e && allowed;
     const root = document.documentElement;
@@ -135,27 +136,66 @@
     return currentWhitelist;
   }
 
-  browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders', 'whitelist']).then(({ tz, ua, enabled, spoofHeaders, whitelist }) => {
-    withWhitelist(whitelist);
-    applyContent({
-      tz, ua, enabled, spoofHeaders,
-      whitelist: currentWhitelist,
-      siteAllowed: isSiteAllowed(resolveHostChain(), whitelist)
-    });
-  }).catch(() => {});
+  // ============================================================
+  // Authoritative per-frame verdict
+  // ============================================================
+  // The isolated world cannot reliably read cross-origin ancestors,
+  // so the REAL chain comes from the background's frame registry
+  // (built out of webRequest parentFrameId data). If the background
+  // is unreachable, fail closed for frames with an unreadable parent
+  // when the exception list is non-empty: stay native rather than
+  // risk patching a challenger's frame.
+  function isTopFrame() {
+    try { return window === window.top; } catch (err) { return true; }
+  }
 
-  
+  async function decideAllowed(localAllowed, whitelist) {
+    let fromBg = null;
+    try {
+      const reply = await browser.runtime.sendMessage({ type: 'tz-guard-frame-verdict' });
+      if (reply && typeof reply.allowed === 'boolean') fromBg = reply.allowed;
+    } catch (err) {}
+    if (fromBg !== null) return fromBg;
+    try {
+      if (Array.isArray(whitelist) && whitelist.length > 0 &&
+          !isTopFrame() && resolveHostChain().length === 1) {
+        return false;
+      }
+    } catch (err) {}
+    return localAllowed;
+  }
+
+  async function boot() {
+    let cfg = {};
+    try {
+      cfg = await browser.storage.local.get(['tz', 'ua', 'enabled', 'spoofHeaders', 'whitelist']);
+    } catch (err) {}
+    const whitelist = withWhitelist(cfg.whitelist);
+    const localAllowed = isSiteAllowed(resolveHostChain(), whitelist);
+    const allowed = await decideAllowed(localAllowed, whitelist);
+    applyContent({
+      tz: cfg.tz, ua: cfg.ua, enabled: cfg.enabled, spoofHeaders: cfg.spoofHeaders,
+      whitelist: currentWhitelist,
+      siteAllowed: allowed
+    });
+  }
+
+  boot();
+
+  async function onUpdate(message) {
+    const whitelist = withWhitelist(message.whitelist);
+    const localAllowed = isSiteAllowed(resolveHostChain(), whitelist);
+    const allowed = await decideAllowed(localAllowed, whitelist);
+    applyContent({
+      tz: message.tz, ua: message.ua, enabled: message.enabled, spoofHeaders: message.spoofHeaders,
+      whitelist: currentWhitelist,
+      siteAllowed: allowed
+    });
+  }
+
   browser.runtime.onMessage.addListener((message) => {
     if (message && message.type === 'config-update') {
-      withWhitelist(message.whitelist);
-      applyContent({
-        tz: message.tz,
-        ua: message.ua,
-        enabled: message.enabled,
-        spoofHeaders: message.spoofHeaders,
-        whitelist: currentWhitelist,
-        siteAllowed: isSiteAllowed(resolveHostChain(), message.whitelist)
-      });
+      onUpdate(message);
     }
   });
 
