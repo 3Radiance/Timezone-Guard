@@ -989,6 +989,21 @@ function patchNativeLook(fn, name, length) {
     EXTENSION_ENABLED = cfg.enabled !== false;
     SPOOF_HEADERS = cfg.spoofHeaders !== false;
 
+    // Per-frame self-check: the bridge's isolated world cannot reliably
+    // read cross-origin ancestors, so never trust its verdict blindly.
+    // This MAIN-world chain CAN read parent.location.href (spec: href
+    // is cross-origin readable), e.g. the Turnstile iframe inside an
+    // excepted ip.cx sees [cf-host, ip.cx] and stays native.
+    if (EXTENSION_ENABLED && Array.isArray(cfg.whitelist) && cfg.whitelist.length > 0 &&
+        !isSiteAllowed(__hostChain, cfg.whitelist)) {
+      EXTENSION_ENABLED = false;
+    } else if (EXTENSION_ENABLED && (!Array.isArray(cfg.whitelist) || cfg.whitelist.length === 0) &&
+               storageCfg && Array.isArray(storageCfg.whitelist) && storageCfg.whitelist.length > 0) {
+      // DOM-marker startup path carries no list of its own — fall back to
+      // the last cached list rather than trusting an unqualified "enabled".
+      if (!isSiteAllowed(__hostChain, storageCfg.whitelist)) EXTENSION_ENABLED = false;
+    }
+
     if (!EXTENSION_ENABLED) {
       restoreNativePatches();
       return;
